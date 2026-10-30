@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+: "${KP2A_NIX_DOTNET:?Run this command inside nix develop}"
+
+case "${1:-help}" in
+  setup)
+    mkdir -p "$(dirname "$DOTNET_ROOT")"
+    exec 9>"$root/.dev/setup.lock"
+    flock 9
+    # Publish the writable SDK only after the copy is complete.
+    if [[ ! -x "$DOTNET_ROOT/dotnet" ]]; then
+      staging=$(mktemp -d "$root/.dev/dotnet-staging.XXXXXX")
+      trap 'rm -rf -- "$staging"' EXIT
+      cp -rL "$KP2A_NIX_DOTNET/." "$staging/"
+      chmod -R u+w "$staging"
+      mv "$staging" "$DOTNET_ROOT"
+    fi
+    dotnet workload install android --skip-manifest-update
+    git submodule update --init src/java/argon2/phc-winner-argon2
+    ;;
+  test)
+    shift
+    dotnet test src/Kp2aAutofillParser.Tests/Kp2aAutofillParser.Tests.csproj "$@"
+    ;;
+  build)
+    shift
+    [[ -x "$DOTNET_ROOT/dotnet" ]] || { echo 'Run kp2a setup first.' >&2; exit 1; }
+    (cd src/build-scripts && bash build-java.sh && bash build-native.sh)
+    ln -sfn Manifests/AndroidManifest_debug.xml src/keepass2android-app/AndroidManifest.xml
+    dotnet build src/keepass2android-app/keepass2android-app.csproj \
+      -c Debug -t:SignAndroidPackage -p:Flavor=Debug \
+      -p:AndroidSdkDirectory="$ANDROID_HOME" -p:JavaSdkDirectory="$JAVA_HOME" \
+      -p:AndroidPackageFormat=apk -p:EmbedAssembliesIntoApk=true "$@"
+    ;;
+  e2e)
+    shift
+    exec python3 "$root/tests/e2e/run.py" "$@"
+    ;;
+  *)
+    echo 'Usage: kp2a {setup|test|build|e2e}'
+    ;;
+esac

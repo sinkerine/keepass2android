@@ -40,6 +40,8 @@
 
 <Import Project="Io/GenerateSecrets.targets" />
 <ItemGroup>
+<!-- Generated after SDK item discovery on the first build; include it exactly once. -->
+<Compile Remove="Io/DropboxFileStorage.g.cs" />
 <Compile Include="Io/DropboxFileStorage.g.cs" />
 </ItemGroup>
 

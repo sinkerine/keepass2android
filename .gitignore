@@ -1,5 +1,9 @@
 PCtest
 
+# Local Nix development state and E2E artifacts
+/.dev/
+/result
+
 *.suo
 *.userprefs
 *.user
