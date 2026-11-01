@@ -33,6 +33,7 @@ using Google.Android.Material.Dialog;
 using keepass2android;
 using keepass2android.database.edit;
 using keepass2android.Io;
+using keepass2android.KeeShare;
 using keepass2android.search;
 using keepass2android.view;
 using keepass2android.views;
@@ -214,6 +215,8 @@ namespace keepass2android
           task = new EditGroup(App.Kp2a, groupName, (PwIcon)groupIconId, groupCustomIconId, App.Kp2a.FindGroup(groupUuid),
                                CreateRefreshAction());
         }
+        var editTarget = strGroupUuid == null ? Group : App.Kp2a.FindGroup(new PwUuid(MemUtil.HexStringToByteArray(strGroupUuid)));
+        if (GroupListFragment.BlocksModification(new IStructureItem[] { editTarget })) return;
         BlockingOperationStarter pt = new BlockingOperationStarter(App.Kp2a, task);
         pt.Run();
       }
@@ -232,7 +235,10 @@ namespace keepass2android
 
       if (resultCode == KeePass.ExitReloadDb)
       {
-        AppTask.SetActivityResult(this, KeePass.ExitReloadDb);
+        var reloadResult = new Intent();
+        AppTask.ToIntent(reloadResult);
+        reloadResult.PutExtra(Kp2aApp.ReloadRequestIdExtra, data?.GetStringExtra(Kp2aApp.ReloadRequestIdExtra));
+        SetResult(KeePass.ExitReloadDb, reloadResult);
         Finish();
       }
 
@@ -561,7 +567,7 @@ namespace keepass2android
       AppTask = AppTask.GetTaskInOnCreate(savedInstanceState, Intent);
 
       // Likely the app has been killed exit the activity 
-      if (App.Kp2a.CurrentDb == null)
+      if (IsFinishing || App.Kp2a.CurrentDb == null)
       {
         Finish();
         return;
@@ -960,7 +966,16 @@ namespace keepass2android
 
 
 
-      var moveElement = new MoveElements(elementsToMove.ToList(), Group, App.Kp2a, new ActionInContextInstanceOnOperationFinished(ContextInstanceId, App.Kp2a,
+      var movedItems = elementsToMove.ToList();
+      var targetDb = GroupListFragment.FindOwningDatabase(Group);
+      if (targetDb == null || !targetDb.CanWrite ||
+          KeeShareGroups.BlocksModification(targetDb, Array.Empty<IStructureItem>(), Group) ||
+          GroupListFragment.BlocksModification(movedItems))
+      {
+        App.Kp2a.ShowMessage(this, Resource.String.keeshare_readonly_info_label, MessageSeverity.Info);
+        return;
+      }
+      var moveElement = new MoveElements(movedItems, Group, App.Kp2a, new ActionInContextInstanceOnOperationFinished(ContextInstanceId, App.Kp2a,
           (success, message, context) =>
           {
             (context as GroupBaseActivity)?.StopMovingElements();
@@ -1260,7 +1275,7 @@ namespace keepass2android
           return true;
 
         case Resource.Id.menu_sync:
-          new SyncUtil(this).StartSynchronizeDatabase(App.Kp2a.CurrentDb, true);
+          SynchronizeCurrentDatabase();
           return true;
 
         case Resource.Id.menu_work_offline:
@@ -1295,6 +1310,11 @@ namespace keepass2android
     }
 
 
+
+    protected virtual void SynchronizeCurrentDatabase()
+    {
+      new SyncUtil(this).StartSynchronizeDatabase(App.Kp2a.CurrentDb, true);
+    }
 
     public override void OnBackPressed()
     {
@@ -1389,7 +1409,13 @@ namespace keepass2android
       FindViewById(Resource.Id.fabSearch).Visibility = ViewStates.Gone;
       FindViewById(Resource.Id.fabTotpOverview).Visibility = ViewStates.Gone;
 
-      UpdateBottomBarElementVisibility(Resource.Id.insert_element, true);
+      var targetDb = GroupListFragment.FindOwningDatabase(Group);
+      var moveTask = AppTask as MoveElementsTask;
+      var canInsert = targetDb != null && targetDb.CanWrite &&
+        !KeeShareGroups.BlocksModification(targetDb, Array.Empty<IStructureItem>(), Group) &&
+        moveTask != null && !GroupListFragment.BlocksModification(
+          moveTask.Uuids.Select(uuid => App.Kp2a.FindStructureItem(uuid)));
+      UpdateBottomBarElementVisibility(Resource.Id.insert_element, canInsert);
       UpdateBottomBarElementVisibility(Resource.Id.cancel_insert_element, true);
 
     }
@@ -1421,7 +1447,8 @@ namespace keepass2android
 
     public void EditGroup(PwGroup pwGroup)
     {
-      GroupEditActivity.Launch(this, pwGroup.ParentGroup, pwGroup);
+      if (!GroupListFragment.BlocksModification(new IStructureItem[] { pwGroup }))
+        GroupEditActivity.Launch(this, pwGroup.ParentGroup, pwGroup);
     }
 
     public IProgressUi ProgressUi
@@ -1559,9 +1586,17 @@ namespace keepass2android
         return false;
       }
 
+      if ((item.ItemId == Resource.Id.menu_delete || item.ItemId == Resource.Id.menu_move ||
+           item.ItemId == Resource.Id.menu_edit || item.ItemId == Resource.Id.menu_copy) && BlocksModification(checkedItems)) return false;
+
       switch (item.ItemId)
       {
-
+        case Resource.Id.menu_keeshare:
+          if (checkedItems.Count != 1 || checkedItems[0] is not PwGroup shareGroup) return false;
+          var shareDb = FindOwningDatabase(shareGroup);
+          if (!EditKeeShareActivity.CanConfigure(shareDb, shareGroup)) return false;
+          EditKeeShareActivity.Launch(Activity, shareDb, shareGroup);
+          break;
         case Resource.Id.menu_delete:
           DeleteMultipleItems((GroupBaseActivity)Activity, checkedItems, ((GroupBaseActivity)Activity).CreateRefreshAction(), App.Kp2a);
           break;
@@ -1643,10 +1678,17 @@ namespace keepass2android
 
     private void UpdateMenuItemVisibilities(ActionMode mode)
     {
+      var selected = GetCheckedItems();
+      bool canModify = selected.Count != 0 && !BlocksModification(selected);
+      mode.Menu.FindItem(Resource.Id.menu_delete)?.SetVisible(canModify);
+      mode.Menu.FindItem(Resource.Id.menu_move)?.SetVisible(canModify);
+      bool canConfigure = selected.Count == 1 && selected[0] is PwGroup selectedGroup &&
+        EditKeeShareActivity.CanConfigure(FindOwningDatabase(selectedGroup), selectedGroup);
+      mode.Menu.FindItem(Resource.Id.menu_keeshare)?.SetVisible(canConfigure);
       var menuItem = mode.Menu.FindItem(Resource.Id.menu_edit);
       if (menuItem != null)
       {
-        menuItem.SetVisible(IsOnlyOneGroupChecked());
+        menuItem.SetVisible(IsOnlyOneGroupChecked() && canModify);
       }
 
       menuItem = mode.Menu.FindItem(Resource.Id.menu_navigate);
@@ -1658,8 +1700,38 @@ namespace keepass2android
       menuItem = mode.Menu.FindItem(Resource.Id.menu_copy);
       if (menuItem != null)
       {
-        menuItem.SetVisible(IsOnlyOneEntryChecked());
+        menuItem.SetVisible(IsOnlyOneEntryChecked() && canModify);
       }
+    }
+
+    // Copies of a database can contain identical UUIDs. Only the live tree identifies its owner.
+    internal static Database FindOwningDatabase(IStructureItem item)
+    {
+      var root = item as PwGroup ?? item?.ParentGroup;
+      if (root == null) return null;
+      while (root.ParentGroup != null) root = root.ParentGroup;
+      return App.Kp2a.OpenDatabases.FirstOrDefault(db => ReferenceEquals(db.KpDatabase.RootGroup, root));
+    }
+
+    internal static bool BlocksModification(IEnumerable<IStructureItem> items)
+    {
+      foreach (var item in items)
+      {
+        if (item == null) return true;
+        var db = FindOwningDatabase(item);
+        if (db == null || !db.CanWrite || KeeShareGroups.BlocksModification(db, new[] { item }, null)) return true;
+      }
+      return false;
+    }
+
+    private List<IStructureItem> GetCheckedItems()
+    {
+      var items = new List<IStructureItem>();
+      var positions = ListView.CheckedItemPositions;
+      for (int i = 0; i < positions.Size(); i++)
+        if (positions.ValueAt(i))
+          items.Add(((PwGroupListAdapter)ListAdapter).GetItemAtPosition(positions.KeyAt(i)));
+      return items;
     }
 
     private bool IsOnlyOneGroupChecked()
@@ -1721,14 +1793,14 @@ namespace keepass2android
 
     public void DeleteMultipleItems(GroupBaseActivity activity, List<IStructureItem> checkedItems, OnOperationFinishedHandler onOperationFinishedHandler, Kp2aApp app)
     {
-      if (checkedItems.Any() == false)
+      if (checkedItems.Any() == false || BlocksModification(checkedItems))
         return;
       //sort checkedItems by database
       List<KeyValuePair<Database, List<IStructureItem>>> itemsForDatabases =
           new List<KeyValuePair<Database, List<IStructureItem>>>();
       foreach (var item in checkedItems)
       {
-        var db = app.FindDatabaseForElement(item);
+        var db = FindOwningDatabase(item);
         if (db != null)
         {
           bool foundDatabase = false;

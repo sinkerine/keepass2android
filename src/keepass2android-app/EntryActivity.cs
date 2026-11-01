@@ -42,6 +42,7 @@ using KeePassLib.Security;
 using KeePassLib.Utility;
 using Keepass2android.Pluginsdk;
 using keepass2android.Io;
+using keepass2android.KeeShare;
 using KeePass.DataExchange;
 using KeePass.Util.Spr;
 using KeePassLib.Interfaces;
@@ -155,7 +156,7 @@ namespace keepass2android
     {
       Intent i = new Intent(act, typeof(EntryActivity));
 
-      var db = App.Kp2a.FindDatabaseForElement(pw);
+      var db = GroupListFragment.FindOwningDatabase(pw);
       i.PutExtra(KeyEntry, new ElementAndDatabaseId(db, pw).FullId);
       i.PutExtra(KeyRefreshPos, pos);
       i.PutExtra(KeyEntryHistoryIndex, historyIndex);
@@ -235,15 +236,21 @@ namespace keepass2android
       SetContentView(Resource.Layout.entry_view);
     }
 
+    private Database OwningDatabase => GroupListFragment.FindOwningDatabase(_historyParentEntry ?? Entry);
+
+    private bool CanModifyEntry => OwningDatabase is Database db && db.CanWrite &&
+      !KeeShareGroups.IsReadOnlyContent(db, (_historyParentEntry ?? Entry).ParentGroup);
+
     protected void SetupEditButtons()
     {
       View edit = FindViewById(Resource.Id.entry_edit);
-      if (App.Kp2a.CurrentDb.CanWrite && _historyIndex < 0)
+      if (CanModifyEntry && _historyIndex < 0)
       {
         edit.Visibility = ViewStates.Visible;
         edit.Click += (sender, e) =>
         {
-          EntryEditActivity.Launch(this, Entry, AppTask);
+          if (CanModifyEntry)
+            EntryEditActivity.Launch(this, Entry, AppTask);
         };
       }
       else
@@ -477,6 +484,9 @@ namespace keepass2android
 
       Intent i = Intent;
       ElementAndDatabaseId dbAndElementId = new ElementAndDatabaseId(i.GetStringExtra(KeyEntry));
+      db = App.Kp2a.GetDatabase(dbAndElementId.DatabaseId);
+      App.Kp2a.CurrentDb = db;
+      _ioc = db.Ioc;
       PwUuid uuid = new PwUuid(MemUtil.HexStringToByteArray(dbAndElementId.ElementIdString));
       _pos = i.GetIntExtra(KeyRefreshPos, -1);
       _historyIndex = i.GetIntExtra(KeyEntryHistoryIndex, -1);
@@ -491,16 +501,18 @@ namespace keepass2android
         Entry = Entry.History.Skip(_historyIndex).First();
         FindViewById<Button>(Resource.Id.btn_restore_history).Click += (sender, args) =>
         {
+          if (!CanModifyEntry) return;
           RestoreFromHistory();
           SaveHistoryChangeAndFinish();
         };
         FindViewById<Button>(Resource.Id.btn_remove_history).Click += (sender, args) =>
         {
+          if (!CanModifyEntry) return;
           RemoveFromHistory();
           SaveHistoryChangeAndFinish();
         };
-
-
+        FindViewById(Resource.Id.btn_restore_history).Visibility = CanModifyEntry ? ViewStates.Visible : ViewStates.Gone;
+        FindViewById(Resource.Id.btn_remove_history).Visibility = CanModifyEntry ? ViewStates.Visible : ViewStates.Gone;
       }
       else
       {
@@ -515,7 +527,7 @@ namespace keepass2android
 
 
 
-      if (PwDefs.IsTanEntry(Entry)
+      if (CanModifyEntry && PwDefs.IsTanEntry(Entry)
           && prefs.GetBoolean(GetString(Resource.String.TanExpiresOnUse_key), Resources.GetBoolean(Resource.Boolean.TanExpiresOnUse_default))
           && ((Entry.Expires == false) || Entry.ExpiryTime > DateTime.Now))
       {
@@ -560,7 +572,7 @@ namespace keepass2android
 
     private void RestoreFromHistory()
     {
-      var db = App.Kp2a.FindDatabaseForElement(_historyParentEntry);
+      var db = OwningDatabase;
       _historyParentEntry.RestoreFromBackup((uint)_historyIndex, db.KpDatabase);
       _historyParentEntry.Touch(true, false);
     }
@@ -574,7 +586,7 @@ namespace keepass2android
         App.Kp2a.DirtyGroups.Add(parent);
       }
 
-      var saveTask = new SaveDb(App.Kp2a, App.Kp2a.FindDatabaseForElement(Entry), new ActionInContextInstanceOnOperationFinished(ContextInstanceId, App.Kp2a, (success, message, context) =>
+      var saveTask = new SaveDb(App.Kp2a, OwningDatabase, new ActionInContextInstanceOnOperationFinished(ContextInstanceId, App.Kp2a, (success, message, context) =>
       {
         if (context is Activity activity)
         {
@@ -1424,7 +1436,7 @@ namespace keepass2android
       foreach (var id in new List<int> { Resource.Id.menu_move, Resource.Id.menu_delete })
       {
         var menuItem = menu.FindItem(id);
-        menuItem?.SetVisible(_historyIndex < 0);
+        menuItem?.SetVisible(_historyIndex < 0 && CanModifyEntry);
       }
 
       return base.OnPrepareOptionsMenu(menu);
@@ -1514,14 +1526,16 @@ namespace keepass2android
         case Resource.Id.menu_donate:
           return Util.GotoDonateUrl(this);
         case Resource.Id.menu_move:
+          if (_historyIndex >= 0 || !CanModifyEntry) return true;
           var navMove = new NavigateToFolderAndLaunchMoveElementTask(App.Kp2a.CurrentDb, Entry.ParentGroup, new List<PwUuid>() { Entry.Uuid }, false);
           AppTask = navMove;
           navMove.SetActivityResult(this, Result.Ok);
           Finish();
           return true;
         case Resource.Id.menu_delete:
-          DeleteEntry task = new DeleteEntry(App.Kp2a, Entry,
-              new ActionOnOperationFinished(App.Kp2a, (success, message, context) => { if (success) { RequiresRefresh(); Finish(); } }));
+          if (_historyIndex >= 0 || !CanModifyEntry) return true;
+          var task = new DeleteMultipleItemsFromOneDatabase(this, OwningDatabase, new List<IStructureItem> { Entry },
+              new ActionOnOperationFinished(App.Kp2a, (success, message, context) => { if (success) { RequiresRefresh(); Finish(); } }), App.Kp2a);
           task.Start();
           break;
         case Resource.Id.menu_toggle_pass:

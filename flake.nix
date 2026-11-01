@@ -20,7 +20,7 @@
     dotnet = pkgs.dotnetCorePackages.combinePackages [ pkgs.dotnetCorePackages.sdk_9_0 pkgs.dotnetCorePackages.sdk_8_0 ];
     env = pkgs.buildFHSEnv {
       name = "kp2a-dev";
-      targetPkgs = p: [ dotnet android.androidsdk p.jdk17 p.git p.gnumake p.python3 p.curl p.unzip p.zip p.which p.file p.procps p.util-linux p.bash p.coreutils p.findutils p.gnugrep p.gnused p.zlib p.icu p.openssl p.stdenv.cc.cc.lib p.libGL p.alsa-lib p.nss p.nspr p.expat p.libxkbcommon p.xorg.libX11 p.xorg.libxcb p.xorg.libXext p.xorg.libXdamage p.xorg.libXfixes p.xorg.libXcomposite p.xorg.libXrandr p.xorg.libXi p.xorg.libXtst ];
+      targetPkgs = p: [ dotnet android.androidsdk p.jdk17 p.git p.gnumake (p.python3.withPackages (ps: [ ps.pykeepass ])) p.curl p.unzip p.zip p.which p.file p.procps p.util-linux p.bash p.coreutils p.findutils p.gnugrep p.gnused p.zlib p.icu p.openssl p.stdenv.cc.cc.lib p.libGL p.alsa-lib p.nss p.nspr p.expat p.libxkbcommon p.xorg.libX11 p.xorg.libxcb p.xorg.libXext p.xorg.libXdamage p.xorg.libXfixes p.xorg.libXcomposite p.xorg.libXrandr p.xorg.libXi p.xorg.libXtst ];
       profile = ''
         export KP2A_IN_FHS=1
         export KP2A_NIX_DOTNET=${dotnet}/share/dotnet
@@ -46,7 +46,7 @@
     devShells.${system}.default = pkgs.mkShell {
       packages = [ (pkgs.writeShellScriptBin "kp2a" ''
         exec ${env}/bin/kp2a-dev -c 'exec "$@"' bash "$(git rev-parse --show-toplevel)/scripts/kp2a" "$@"
-      '') pkgs.git ];
+      '') pkgs.git (pkgs.python3.withPackages (ps: [ ps.pykeepass ])) ];
 
     };
     packages.${system}.default = env;

@@ -27,4 +27,7 @@
         android:showAsAction="always"
     />
 
+  <item android:id="@+id/menu_keeshare"
+        android:title="@string/menu_keeshare"
+        android:showAsAction="never" />
 </menu>

@@ -23,6 +23,7 @@ case "${1:-help}" in
   test)
     shift
     dotnet test src/Kp2aAutofillParser.Tests/Kp2aAutofillParser.Tests.csproj "$@"
+    dotnet test src/Kp2aKeeShare.Tests/Kp2aKeeShare.Tests.csproj "$@"
     ;;
   build)
     shift

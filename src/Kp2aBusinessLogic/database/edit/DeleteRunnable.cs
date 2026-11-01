@@ -186,7 +186,7 @@ namespace keepass2android
       PwGroup pgRecycleBin = pd.RootGroup.FindGroup(pd.RecycleBinUuid, true);
 
       bool bUpdateGroupList = false;
-      DateTime dtNow = DateTime.Now;
+      DateTime dtNow = DateTime.UtcNow;
 
       PwGroup pgParent = pe.ParentGroup;
       if (pgParent != null)
@@ -284,7 +284,7 @@ namespace keepass2android
       if (pg.Uuid.Equals(pd.EntryTemplatesGroup))
       {
         pd.EntryTemplatesGroup = PwUuid.Zero;
-        pd.EntryTemplatesGroupChanged = DateTime.Now;
+        pd.EntryTemplatesGroupChanged = DateTime.UtcNow;
       }
 
       pgParent.Groups.Remove(pg);
@@ -293,7 +293,7 @@ namespace keepass2android
       {
         pg.DeleteAllObjects(pd);
 
-        PwDeletedObject pdo = new PwDeletedObject(pg.Uuid, DateTime.Now);
+        PwDeletedObject pdo = new PwDeletedObject(pg.Uuid, DateTime.UtcNow);
         pd.DeletedObjects.Add(pdo);
 
 

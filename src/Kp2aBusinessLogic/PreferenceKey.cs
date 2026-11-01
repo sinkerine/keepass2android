@@ -22,6 +22,8 @@ namespace keepass2android
   {
     remember_keyfile,
     UseFileTransactions,
-    CheckForFileChangesOnSave
+    CheckForFileChangesOnSave,
+    keeshare_import_enabled,
+    keeshare_export_enabled
   }
 }

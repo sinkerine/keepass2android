@@ -24,6 +24,7 @@
     <ProjectReference Include="..\JavaFileStorageBindings\JavaFileStorageBindings.csproj" Condition="'$(Flavor)'!='NoNet'" />
     <ProjectReference Include="..\KeePassLib2Android\KeePassLib2Android.csproj" />
     <ProjectReference Include="..\KP2AKdbLibraryBinding\KP2AKdbLibraryBinding.csproj" />
+    <ProjectReference Include="..\Kp2aKeeShare\Kp2aKeeShare.csproj" />
     <ProjectReference Include="..\TwofishCipher\TwofishCipher.csproj" />
   </ItemGroup>
   <ItemGroup>

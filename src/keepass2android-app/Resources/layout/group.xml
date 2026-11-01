@@ -364,12 +364,20 @@
 
         />
   
+    <TextView
+        android:id="@+id/keeshare_readonly_info"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_below="@id/background_ops_container"
+        android:text="@string/keeshare_readonly_info_label"
+        android:visibility="gone" />
+
     <androidx.coordinatorlayout.widget.CoordinatorLayout
         android:id="@+id/main_content"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:layout_above="@id/divider2"
-        android:layout_below="@id/background_ops_container"
+        android:layout_below="@id/keeshare_readonly_info"
         android:fitsSystemWindows="true">
         <fragment
             android:name="keepass2android.GroupListFragment"

@@ -105,6 +105,19 @@ namespace keepass2android
     ReadOnlyReason_LocalBackup,
     Ok,
     cancel,
-    FileNotFound
+    FileNotFound,
+    KeeShareImporting,
+    KeeShareExporting,
+    KeeShareLocationNotSet,
+    KeeShareWrongPassword,
+    KeeShareFileNotFound,
+    KeeShareImportedChanges,
+    KeeShareFailed,
+    KeeShareDatabaseReadOnly,
+    KeeShareSmbCredentialsNeeded,
+    KeeShareOffline,
+    KeeShareStorageUnavailable,
+    KeeShareRememberMount,
+    KeeShareImportRequired
   }
 }

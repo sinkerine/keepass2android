@@ -47,6 +47,7 @@ using Android.Runtime;
 using Android.Util;
 using Google.Android.Material.Dialog;
 using keepass2android.Io;
+using keepass2android.KeeShare;
 using KeePassLib.Serialization;
 using KeeTrayTOTP.Libraries;
 using PluginTOTP;
@@ -600,6 +601,7 @@ namespace keepass2android
 
     public const String KeyEntry = "entry";
     public const String KeyParent = "parent";
+    private const string KeyDatabase = "database";
     public const String KeyTemplateUuid = "KeyTemplateUuid";
 
     public const int ResultOkIconPicker = (int)Result.FirstUser + 1000;
@@ -622,6 +624,7 @@ namespace keepass2android
       Intent i = new Intent(act, typeof(EntryEditActivity));
 
       i.PutExtra(KeyEntry, pw.Uuid.ToHexString());
+      i.PutExtra(KeyDatabase, GroupListFragment.FindOwningDatabase(pw)?.IocAsHexString());
 
       appTask.ToIntent(i);
 
@@ -634,11 +637,23 @@ namespace keepass2android
 
       PwGroup parent = pw;
       i.PutExtra(KeyParent, parent.Uuid.ToHexString());
+      i.PutExtra(KeyDatabase, GroupListFragment.FindOwningDatabase(parent)?.IocAsHexString());
       i.PutExtra(KeyTemplateUuid, templateUuid.ToHexString());
 
       appTask.ToIntent(i);
 
       act.StartActivityForResult(i, 0);
+    }
+
+    private bool RefuseModification(PwGroup parent)
+    {
+      var db = GroupListFragment.FindOwningDatabase(parent);
+      bool imported = db != null && KeeShareGroups.IsReadOnlyContent(db, parent);
+      if (db != null && db.CanWrite && !imported) return false;
+      Toast.MakeText(this, imported ? Resource.String.keeshare_readonly_info_label : Resource.String.FileReadOnlyTitle,
+        ToastLength.Long).Show();
+      Finish();
+      return true;
     }
 
     bool _closeForReload;
@@ -686,11 +701,19 @@ namespace keepass2android
       {
         //recreating, e.g. after configuration change.
         //property "State" will return the state
+        var parent = State.IsNew ? State.ParentGroup : State.EntryInDatabase.ParentGroup;
+        if (RefuseModification(parent)) return;
+        var db = GroupListFragment.FindOwningDatabase(parent);
+        App.Kp2a.CurrentDb = db;
+        _ioc = db.Ioc;
 
       }
       else
       {
-        Database db = App.Kp2a.CurrentDb;
+        var databaseId = Intent.GetStringExtra(KeyDatabase);
+        Database db = databaseId == null ? App.Kp2a.CurrentDb : App.Kp2a.GetDatabase(databaseId);
+        App.Kp2a.CurrentDb = db;
+        _ioc = db.Ioc;
 
         App.Kp2a.EntryEditActivityState = new EntryEditActivityState();
         ISharedPreferences prefs = PreferenceManager.GetDefaultSharedPreferences(this);
@@ -709,6 +732,7 @@ namespace keepass2android
           //creating new entry
           String groupId = i.GetStringExtra(KeyParent);
           State.ParentGroup = db.KpDatabase.RootGroup.FindGroup(new PwUuid(MemUtil.HexStringToByteArray(groupId)), true);
+          if (RefuseModification(State.ParentGroup)) return;
 
           PwUuid templateId = new PwUuid(MemUtil.HexStringToByteArray(i.GetStringExtra(KeyTemplateUuid)));
           PwEntry templateEntry = null;
@@ -741,6 +765,7 @@ namespace keepass2android
           Debug.Assert(entryId != null);
 
           State.EntryInDatabase = db.EntriesById[entryId];
+          if (RefuseModification(State.EntryInDatabase.ParentGroup)) return;
           State.IsNew = false;
 
 
@@ -1070,7 +1095,10 @@ namespace keepass2android
 
     void SaveEntry()
     {
-      Database db = App.Kp2a.CurrentDb;
+      var parent = State.IsNew ? State.ParentGroup : State.EntryInDatabase.ParentGroup;
+      if (RefuseModification(parent)) return;
+      Database db = GroupListFragment.FindOwningDatabase(parent);
+      App.Kp2a.CurrentDb = db;
       EntryEditActivity act = this;
 
       if (!ValidateBeforeSaving())

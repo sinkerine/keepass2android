@@ -23,6 +23,8 @@ using Android.OS;
 using Android.Preferences;
 using Android.Views;
 using Android.Widget;
+using AndroidX.Core.Content;
+using AndroidX.Lifecycle;
 using keepass2android.view;
 using keepass2android;
 using KeePassLib;
@@ -46,17 +48,24 @@ namespace keepass2android.search
   [IntentFilter(new[] { Intent.ActionSearch }, Categories = new[] { Intent.CategoryDefault })]
   public class SearchResults : GroupBaseActivity
   {
+    private bool _readLockAcquired;
+    private SearchSyncHandoff _syncHandoff;
+
     protected override void OnCreate(Bundle bundle)
     {
-      //we don't want any background thread to update/reload the database while we're in this activity. We're showing a temporary group, so background updating doesn't work well.
-      if (!App.Kp2a.DatabasesBackgroundModificationLock.TryEnterReadLock(TimeSpan.FromSeconds(5)))
+      // The temporary group contains live entries: keep the reader until its UI is destroyed.
+      _readLockAcquired = App.Kp2a.DatabasesBackgroundModificationLock.TryEnterReadLock(TimeSpan.FromSeconds(5));
+      if (!_readLockAcquired)
+        Finish();
+
+      // Android requires base creation even when lock acquisition fails. GroupBaseActivity
+      // skips initializing the list when this activity is already finishing.
+      base.OnCreate(bundle);
+      if (!_readLockAcquired)
       {
         App.Kp2a.ShowMessage(this, GetString(Resource.String.failed_to_access_database), MessageSeverity.Error);
-        Finish();
         return;
       }
-
-      base.OnCreate(bundle);
 
       if (IsFinishing)
       {
@@ -70,8 +79,109 @@ namespace keepass2android.search
 
     protected override void OnDestroy()
     {
-      base.OnDestroy();
-      App.Kp2a.DatabasesBackgroundModificationLock.ExitReadLock();
+      try
+      {
+        base.OnDestroy();
+      }
+      finally
+      {
+        if (_readLockAcquired)
+        {
+          App.Kp2a.DatabasesBackgroundModificationLock.ExitReadLock();
+          _readLockAcquired = false;
+        }
+        var handoff = _syncHandoff;
+        _syncHandoff = null;
+        handoff?.OnReaderReleased();
+      }
+    }
+
+    protected override void SynchronizeCurrentDatabase()
+    {
+      if (_syncHandoff != null || IsFinishing || !_readLockAcquired)
+        return;
+
+      var database = App.Kp2a.CurrentDb;
+      if (!App.Kp2a.DatabaseIsUnlocked || database == null || !App.Kp2a.OpenDatabases.Contains(database))
+        return;
+
+      _syncHandoff = new SearchSyncHandoff(Application, database);
+      AppTask.SetActivityResult(this, KeePass.ExitNormal);
+      Finish();
+    }
+
+    // Neither OnResume nor OnDestroy is guaranteed to happen first during a return.
+    // Observe both, and enqueue once only after destruction has released the reader.
+    private sealed class SearchSyncHandoff : BroadcastReceiver, Application.IActivityLifecycleCallbacks, ILifecycleEventObserver
+    {
+      private readonly Application _application;
+      private Database _database;
+      private bool _readerReleased;
+
+      public SearchSyncHandoff(Application application, Database database)
+      {
+        _application = application;
+        _database = database;
+        _application.RegisterActivityLifecycleCallbacks(this);
+        ContextCompat.RegisterReceiver(_application, this, new IntentFilter(Intents.DatabaseLocked), (int)ReceiverFlags.NotExported);
+        ProcessLifecycleOwner.Get().Lifecycle.AddObserver(this);
+      }
+
+      public void OnReaderReleased()
+      {
+        _readerReleased = true;
+        PostTrySynchronize();
+      }
+
+      private void PostTrySynchronize()
+      {
+        // Post past the complete activity callback, including timeout checks and UI setup.
+        App.Kp2a.UiThreadHandler.Post(TrySynchronize);
+      }
+
+      private void TrySynchronize()
+      {
+        if (_database == null)
+          return;
+        if (!App.Kp2a.DatabaseIsUnlocked || !App.Kp2a.OpenDatabases.Any(db => ReferenceEquals(db, _database)))
+        {
+          Cancel();
+          return;
+        }
+        if (!_readerReleased || App.Kp2a.ActiveContext is not LifecycleAwareActivity activity ||
+            activity is SearchResults || activity.IsFinishing || activity.IsDestroyed ||
+            !activity.Lifecycle.CurrentState.IsAtLeast(Lifecycle.State.Resumed))
+          return;
+
+        var database = _database;
+        Cancel();
+        new SyncUtil(activity).StartSynchronizeDatabase(database, true);
+      }
+
+      private void Cancel()
+      {
+        if (_database == null)
+          return;
+        _database = null;
+        _application.UnregisterActivityLifecycleCallbacks(this);
+        _application.UnregisterReceiver(this);
+        ProcessLifecycleOwner.Get().Lifecycle.RemoveObserver(this);
+      }
+
+      public override void OnReceive(Context context, Intent intent) => Cancel();
+      public void OnStateChanged(ILifecycleOwner source, Lifecycle.Event lifecycleEvent)
+      {
+        // Do not retain a user request across backgrounding/locking the app.
+        if (lifecycleEvent == Lifecycle.Event.OnStop)
+          Cancel();
+      }
+      public void OnActivityResumed(Activity activity) => PostTrySynchronize();
+      public void OnActivityDestroyed(Activity activity) => PostTrySynchronize();
+      public void OnActivityCreated(Activity activity, Bundle savedInstanceState) { }
+      public void OnActivityStarted(Activity activity) { }
+      public void OnActivityPaused(Activity activity) { }
+      public void OnActivityStopped(Activity activity) { }
+      public void OnActivitySaveInstanceState(Activity activity, Bundle outState) { }
     }
 
     public override bool EntriesBelongToCurrentDatabaseOnly
@@ -87,6 +197,8 @@ namespace keepass2android.search
 
     protected override void OnNewIntent(Intent intent)
     {
+      if (IsFinishing || !_readLockAcquired || _syncHandoff != null)
+        return;
       ProcessIntent(intent);
     }
 
@@ -96,6 +208,7 @@ namespace keepass2android.search
       if (!App.Kp2a.DatabaseIsUnlocked)
       {
         Finish();
+        return;
       }
 
       if (intent.Action == Intent.ActionView)

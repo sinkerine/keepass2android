@@ -34,6 +34,7 @@ using Android.Widget;
 using Java.IO;
 using Java.Net;
 using keepass2android.Io;
+using keepass2android.KeeShare;
 using keepass2android.Utils;
 using keepass2android;
 using KeePassLib;
@@ -262,6 +263,12 @@ namespace keepass2android
     protected override void OnCreate(Bundle savedInstanceState)
     {
       base.OnCreate(savedInstanceState);
+      var pendingSyncs = savedInstanceState?.GetStringArrayList(PendingBackgroundSyncsKey);
+      if (pendingSyncs != null)
+        _pendingBackgroundSyncs.AddRange(pendingSyncs.Select(IOConnectionInfo.UnserializeFromString));
+      var keeShareReloadIoc = savedInstanceState?.GetString(KeeShareReloadIocKey);
+      if (keeShareReloadIoc != null)
+        _keeShareReloadIoc = IOConnectionInfo.UnserializeFromString(keeShareReloadIoc);
       PredictiveBack.Register(this, HandlePredictiveBackPressed);
       SetContentView(Resource.Layout.open_db_selection);
 
@@ -490,6 +497,8 @@ namespace keepass2android
 
         }
 
+        StartPendingBackgroundSyncs();
+
         //database(s) unlocked
         if ((App.Kp2a.OpenDatabases.Count() == 1) || (AppTask is SearchUrlTask))
         {
@@ -574,7 +583,39 @@ namespace keepass2android
     private OpenDatabaseAdapter _adapter;
     private MyBroadcastReceiver _intentReceiver;
     private bool _isForeground;
+    private const string PendingBackgroundSyncsKey = "PendingBackgroundSyncs";
     private readonly List<IOConnectionInfo> _pendingBackgroundSyncs = new List<IOConnectionInfo>();
+    private const string KeeShareReloadIocKey = "KeeShareReloadIoc";
+    private IOConnectionInfo _keeShareReloadIoc;
+
+    protected override void OnSaveInstanceState(Bundle outState)
+    {
+      base.OnSaveInstanceState(outState);
+      outState.PutStringArrayList(PendingBackgroundSyncsKey,
+          _pendingBackgroundSyncs.Select(IOConnectionInfo.SerializeToString).ToList());
+      if (_keeShareReloadIoc != null)
+        outState.PutString(KeeShareReloadIocKey, IOConnectionInfo.SerializeToString(_keeShareReloadIoc));
+    }
+
+    private void StartPendingBackgroundSyncs()
+    {
+      var pendingSyncs = _pendingBackgroundSyncs.ToList();
+      _pendingBackgroundSyncs.Clear();
+      foreach (var pendingSyncIoc in pendingSyncs)
+      {
+        try
+        {
+          var dbForIoc = App.Kp2a.TryGetDatabase(pendingSyncIoc);
+          if (dbForIoc != null)
+            new SyncUtil(this).StartSynchronizeDatabase(dbForIoc, false);
+        }
+        catch (Exception e)
+        {
+          App.Kp2a.ShowMessage(this, "Failed to synchronize database", MessageSeverity.Error);
+          Kp2aLog.LogUnexpectedError(e);
+        }
+      }
+    }
 
     public override void OnBackPressed()
     {
@@ -625,6 +666,10 @@ namespace keepass2android
 
       if (requestCode == ReqCodeOpenNewDb)
       {
+        // Consume the accepted reload intent only for this open result. Cancellation or
+        // failure must not leave an export request attached to a later unrelated open.
+        var keeShareReloadIoc = _keeShareReloadIoc;
+        _keeShareReloadIoc = null;
         switch ((int)resultCode)
         {
           case (int)Result.Ok:
@@ -635,36 +680,25 @@ namespace keepass2android
             //we first store the required sync operation and delay its execution until we loaded all AutoOpen entries (from local file)
             //if required
             bool requiresSubsequentSync = data?.GetBooleanExtra("requiresSubsequentSync", false) ?? false;
-            if (requiresSubsequentSync)
+            if (requiresSubsequentSync && !_pendingBackgroundSyncs.Any(pending => pending.IsSameFileAs(ioc)))
             {
               _pendingBackgroundSyncs.Add(ioc);
             }
 
             if (App.Kp2a.TrySelectCurrentDb(ioc))
             {
-              if (OpenAutoExecEntries(App.Kp2a.CurrentDb)) return;
+              var openedDatabase = App.Kp2a.CurrentDb;
+              bool openingChildDatabase = OpenAutoExecEntries(openedDatabase);
+              // Trigger for this IOC even when opening a child returns early.
+              // A pending sync will trigger Both after it succeeds instead.
+              if (!_pendingBackgroundSyncs.Any(pending => pending.IsSameFileAs(ioc)))
+                KeeShareScheduler.Enqueue(App.Kp2a, openedDatabase,
+                    keeShareReloadIoc?.IsSameFileAs(ioc) == true ? KeeShareSyncMode.Both : KeeShareSyncMode.Import);
+              if (openingChildDatabase) return;
               LaunchingOther = true;
               AppTask.CanActivateSearchViewOnStart = true;
 
-              foreach (var pendingSyncIoc in _pendingBackgroundSyncs)
-              {
-                try
-                {
-                  var dbForIoc = App.Kp2a.TryGetDatabase(pendingSyncIoc);
-                  if (dbForIoc == null)
-                  {
-                    continue;
-                  }
-                  new SyncUtil(this).StartSynchronizeDatabase(dbForIoc, false);
-                }
-                catch (Exception e)
-                {
-                  App.Kp2a.ShowMessage(this, "Failed to synchronize database", MessageSeverity.Error);
-                  Kp2aLog.LogUnexpectedError(e);
-                }
-              }
-
-              _pendingBackgroundSyncs.Clear();
+              StartPendingBackgroundSyncs();
 
               AppTask.LaunchFirstGroupActivity(this);
             }
@@ -720,14 +754,17 @@ namespace keepass2android
           break;
         case KeePass.ExitReloadDb:
 
-          if (App.Kp2a.CurrentDb != null)
+          var reloadDatabase = App.Kp2a.TakeRequestedReload(
+              data?.GetStringExtra(Kp2aApp.ReloadRequestIdExtra), out bool synchronizeKeeShare);
+          if (reloadDatabase != null)
           {
-            //remember the composite key for reloading:
-            var compositeKey = App.Kp2a.CurrentDb.KpDatabase.MasterKey;
-            var ioc = App.Kp2a.CurrentDb.Ioc;
+            // Use the database captured by the prompt, even if the current database changed.
+            var compositeKey = reloadDatabase.KpDatabase.MasterKey;
+            var ioc = reloadDatabase.Ioc;
+            _keeShareReloadIoc = synchronizeKeeShare ? ioc : null;
 
             //lock the database:
-            App.Kp2a.CloseDatabase(App.Kp2a.CurrentDb);
+            App.Kp2a.CloseDatabase(reloadDatabase);
 
             LaunchPasswordActivityForReload(ioc, compositeKey);
           }

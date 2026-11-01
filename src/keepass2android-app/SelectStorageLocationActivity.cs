@@ -53,10 +53,6 @@ namespace keepass2android
       Kp2aLog.Log("SelectStorageLocationActivity.OnCreate");
 
 
-      if (IsStorageSelectionForSave)
-      {
-        throw new Exception("save is not yet implemented. In StartSelectFile, no handler for onCreate is passed.");
-      }
 
       bool allowThirdPartyGet = Intent.GetBooleanExtra(FileStorageSelectionActivity.AllowThirdPartyAppGet, false);
       bool allowThirdPartySend = Intent.GetBooleanExtra(FileStorageSelectionActivity.AllowThirdPartyAppSend, false);
@@ -113,7 +109,8 @@ namespace keepass2android
 
     protected override void StartSelectFile(bool isForSave, int browseRequestCode, string protocolId)
     {
-      FileSelectHelper fileSelectHelper = new FileSelectHelper(this, isForSave, true, browseRequestCode);
+      // Manual filename dialogs must not create or truncate a destination during selection.
+      FileSelectHelper fileSelectHelper = new FileSelectHelper(this, isForSave && !IsStorageSelectionForSave, true, browseRequestCode);
       fileSelectHelper.OnOpen += (sender, ioc) =>
       {
         IocSelected(ioc, browseRequestCode);
@@ -124,14 +121,25 @@ namespace keepass2android
       };
 
       App.Kp2a.GetFileStorage(protocolId).StartSelectFile(new FileStorageSetupInitiatorActivity(this,
-                                                                                                            OnActivityResult,
-                                                                                                            s => fileSelectHelper.PerformManualFileSelect(s)
-                                                                          ), isForSave, browseRequestCode, protocolId);
+        OnActivityResult, defaultPath =>
+        {
+          // The helper's local save dialog creates/truncates the file. Use the chooser
+          // to select a destination without touching its contents before export.
+          if (isForSave && IOConnectionInfo.FromPath(defaultPath).IsLocalFile())
+            StartFileChooser(defaultPath, browseRequestCode, true);
+          else fileSelectHelper.PerformManualFileSelect(defaultPath);
+        }), isForSave, browseRequestCode, protocolId);
     }
 
     protected override void ShowAndroidBrowseDialog(int requestCode, bool isForSave, bool tryGetPermanentAccess)
     {
-      Util.ShowBrowseDialog(this, requestCode, isForSave, tryGetPermanentAccess);
+      if (IsStorageSelectionForSave)
+      {
+        // ACTION_CREATE_DOCUMENT creates a file immediately. Export selection only accepts existing documents.
+        App.Kp2a.ShowMessage(this, Resource.String.keeshare_destination_existing_file, MessageSeverity.Info);
+        Util.ShowBrowseDialog(this, requestCode, false, true);
+      }
+      else Util.ShowBrowseDialog(this, requestCode, isForSave, tryGetPermanentAccess);
     }
 
     protected override bool IsStorageSelectionForSave
@@ -139,6 +147,57 @@ namespace keepass2android
       get { return Intent.GetBooleanExtra(FileStorageSetupDefs.ExtraIsForSave, false); }
     }
 
+
+    protected override void SaveIocSelected(IOConnectionInfo ioc)
+    {
+      try
+      {
+        var storage = App.Kp2a.GetFileStorage(ioc, false);
+        bool readOnly;
+        if (ioc.IsLocalFile())
+        {
+          // BuiltInFileStorage.IsReadOnly opens FileOutputStream for append. Check permissions only.
+          var file = new Java.IO.File(ioc.Path);
+          var parent = file.ParentFile;
+          readOnly = (storage is BuiltInFileStorage builtIn && builtIn.IsLocalBackup(ioc)) ||
+            file.IsDirectory || (file.Exists() && !file.CanWrite()) ||
+            parent == null || !parent.IsDirectory || !parent.CanWrite();
+        }
+        else if (ioc.Path.StartsWith("content://", StringComparison.OrdinalIgnoreCase))
+        {
+          readOnly = !System.Linq.Enumerable.Any(ContentResolver.PersistedUriPermissions,
+            permission => permission.Uri.ToString() == ioc.Path && permission.IsWritePermission);
+        }
+        else readOnly = storage.IsReadOnly(ioc);
+
+        if (readOnly || !storage.IsPermanentLocation(ioc))
+        {
+          RejectSaveDestination(Resource.String.keeshare_destination_unwritable);
+          return;
+        }
+        ReturnOk(ioc);
+      }
+      catch (Exception)
+      {
+        RejectSaveDestination(Resource.String.KeeShareStorageUnavailable);
+      }
+    }
+
+    private void RejectSaveDestination(int message)
+    {
+      ShowAlertDialog(GetString(message),
+        (sender, args) => StartFileStorageSelection(RequestCodeFileStorageSelectionForPrimarySelect, false, false),
+        (sender, args) => ReturnCancel());
+    }
+
+    private static bool RequiresExistingFile(string path)
+    {
+      // These providers encode item IDs, not a parent path with a filename appended.
+      // Resolving a new filename through CreateFilePath would create/upload before Save.
+      return path.StartsWith("onedrive", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWith("gdrive", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWith("content://", StringComparison.OrdinalIgnoreCase);
+    }
 
     protected override void OnSaveInstanceState(Bundle outState)
     {
@@ -228,6 +287,41 @@ namespace keepass2android
     protected override void OnActivityResult(int requestCode, Result resultCode, Intent data)
     {
       Kp2aLog.Log("onAR");
+      if (IsStorageSelectionForSave && resultCode == Result.Ok && data != null)
+      {
+        var filename = Util.GetFilenameFromInternalFileChooser(data, this);
+        if (filename != null)
+        {
+          bool exists = data.GetBooleanExtra("group.pals.android.lib.ui.filechooser.FileChooserActivity.result_file_exists", true);
+          if (!exists && RequiresExistingFile(filename))
+          {
+            RejectSaveDestination(Resource.String.keeshare_destination_existing_file);
+            return;
+          }
+          IocSelected(IOConnectionInfo.FromPath(FileSelectHelper.ConvertFilenameToIocPath(filename)), requestCode);
+          return;
+        }
+        if (data.Data?.Scheme == "content")
+        {
+          IoUtil.TryTakePersistablePermissions(ContentResolver, data.Data);
+          IocSelected(IOConnectionInfo.FromPath(data.DataString), requestCode);
+          return;
+        }
+      }
+      if (IsStorageSelectionForSave && resultCode == (Result)keepass2android.Io.FileStorageResults.FileChooserPrepared)
+      {
+        var ioc = new IOConnectionInfo();
+        Util.SetIoConnectionFromIntent(ioc, data);
+        StartFileChooser(ioc.Path, requestCode, true);
+        return;
+      }
+      if (IsStorageSelectionForSave && resultCode == (Result)keepass2android.Io.FileStorageResults.FileUsagePrepared)
+      {
+        var ioc = new IOConnectionInfo();
+        Util.SetIoConnectionFromIntent(ioc, data);
+        IocSelected(ioc, requestCode);
+        return;
+      }
       base.OnActivityResult(requestCode, resultCode, data);
     }
 

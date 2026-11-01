@@ -23,7 +23,6 @@ using SMBLibrary.Client;
 using SMBLibrary;
 using FileAttributes = SMBLibrary.FileAttributes;
 using KeePassLib.Utility;
-using Java.Nio.FileNio;
 
 namespace Kp2aBusinessLogic.Io
 {
@@ -234,7 +233,8 @@ namespace Kp2aBusinessLogic.Io
         var status = Client.Login(info.Domain ?? string.Empty, info.Username, info.Password);
         if (status != NTStatus.STATUS_SUCCESS)
         {
-          throw new Exception($"Failed to login to SMB as {info.Username}");
+          Client.Disconnect();
+          throw new IOException($"Failed to login to SMB server {info.Host}: {status}");
         }
 
         _isLoggedIn = true;
@@ -242,6 +242,11 @@ namespace Kp2aBusinessLogic.Io
         if (!string.IsNullOrEmpty(info.Share))
         {
           FileStore = Client.TreeConnect(info.Share, out status);
+          if (status != NTStatus.STATUS_SUCCESS)
+          {
+            Dispose();
+            ThrowIfFailed(status, "connect to share", info);
+          }
         }
 
       }
@@ -270,6 +275,18 @@ namespace Kp2aBusinessLogic.Io
 
 
 
+    private static void ThrowIfFailed(NTStatus status, string operation, SmbConnectionInfo info)
+    {
+      if (status == NTStatus.STATUS_SUCCESS)
+        return;
+
+      string message = $"Failed to {operation} {info.GetPathWithoutCredentials()}: {status}";
+      if (status == NTStatus.STATUS_OBJECT_NAME_NOT_FOUND || status == NTStatus.STATUS_OBJECT_PATH_NOT_FOUND)
+        throw new FileNotFoundException(message);
+
+      throw new IOException(message);
+    }
+
     public Stream OpenFileForRead(IOConnectionInfo ioc)
     {
 
@@ -287,32 +304,40 @@ namespace Kp2aBusinessLogic.Io
           CreateDisposition.FILE_OPEN,
           CreateOptions.FILE_NON_DIRECTORY_FILE | CreateOptions.FILE_SYNCHRONOUS_IO_ALERT, null);
 
-      if (status != NTStatus.STATUS_SUCCESS)
+      ThrowIfFailed(status, "open file for reading", info);
+      try
       {
-        throw new Exception($"Failed to open file {info.LocalPath}");
-      }
+        var stream = new MemoryStream();
+        try
+        {
+          long bytesRead = 0;
+          while (true)
+          {
+            status = conn.FileStore.ReadFile(out var data, fileHandle, bytesRead, (int)conn.Client.MaxReadSize);
+            if (status == NTStatus.STATUS_END_OF_FILE)
+              break;
 
-      var stream = new MemoryStream();
-      long bytesRead = 0;
-      while (true)
+            ThrowIfFailed(status, "read file", info);
+            if (data.Length == 0)
+              break;
+
+            bytesRead += data.Length;
+            stream.Write(data, 0, data.Length);
+          }
+
+          stream.Position = 0;
+          return stream;
+        }
+        catch
+        {
+          stream.Dispose();
+          throw;
+        }
+      }
+      finally
       {
-        status = conn.FileStore.ReadFile(out var data, fileHandle, bytesRead, (int)conn.Client.MaxReadSize);
-        if (status != NTStatus.STATUS_SUCCESS && status != NTStatus.STATUS_END_OF_FILE)
-        {
-          throw new Exception("Failed to read from file");
-        }
-
-        if (status == NTStatus.STATUS_END_OF_FILE || data.Length == 0)
-        {
-          break;
-        }
-
-        bytesRead += data.Length;
-        stream.Write(data, 0, data.Length);
+        conn.FileStore.CloseFile(fileHandle);
       }
-
-      stream.Seek(0, SeekOrigin.Begin);
-      return stream;
     }
 
 
@@ -355,12 +380,28 @@ namespace Kp2aBusinessLogic.Io
 
       public void CommitWrite()
       {
-        _fileStorage.UploadData(new MemoryStream(_memoryStream!.ToArray()), new SmbConnectionInfo(new IOConnectionInfo() { Path = _uploadPath }));
+        using var data = new MemoryStream(_memoryStream!.ToArray());
+        _fileStorage.UploadData(data, new SmbConnectionInfo(new IOConnectionInfo() { Path = _uploadPath }));
         if (UseFileTransaction)
         {
           SmbConnectionInfo uploadPath = new SmbConnectionInfo(new IOConnectionInfo() { Path = _uploadPath });
           SmbConnectionInfo finalPath = new SmbConnectionInfo(new IOConnectionInfo() { Path = _path });
-          _fileStorage.RenameFile(uploadPath, finalPath);
+          try
+          {
+            _fileStorage.RenameFile(uploadPath, finalPath);
+          }
+          catch
+          {
+            try
+            {
+              _fileStorage.DeleteTemporaryFile(uploadPath);
+            }
+            catch
+            {
+              // Cleanup must not hide the original rename failure.
+            }
+            throw;
+          }
         }
 
 
@@ -373,17 +414,39 @@ namespace Kp2aBusinessLogic.Io
 
       // Open existing file
       var status = connection.FileStore!.CreateFile(out var handle, out _, fromPath.GetLocalSmbPath(), AccessMask.MAXIMUM_ALLOWED, 0, ShareAccess.Read, CreateDisposition.FILE_OPEN, CreateOptions.FILE_NON_DIRECTORY_FILE, null);
-      if (status != NTStatus.STATUS_SUCCESS)
-        throw new Exception($"Failed to open {fromPath.LocalPath} for renaming!");
-
-      FileRenameInformationType2 renameInfo = new FileRenameInformationType2
+      ThrowIfFailed(status, "open file for renaming", fromPath);
+      try
       {
-        FileName = toPath.GetLocalSmbPath(),
-        ReplaceIfExists = true
-      };
-      connection.FileStore.SetFileInformation(handle, renameInfo);
-      connection.FileStore.CloseFile(handle);
+        FileRenameInformationType2 renameInfo = new FileRenameInformationType2
+        {
+          FileName = toPath.GetLocalSmbPath(),
+          ReplaceIfExists = true
+        };
+        status = connection.FileStore.SetFileInformation(handle, renameInfo);
+        ThrowIfFailed(status, "rename file", toPath);
+      }
+      finally
+      {
+        connection.FileStore.CloseFile(handle);
+      }
+    }
 
+    private void DeleteTemporaryFile(SmbConnectionInfo path)
+    {
+      using var connection = new SmbConnection(path);
+      var status = connection.FileStore!.CreateFile(out var handle, out _, path.GetLocalSmbPath(),
+          AccessMask.DELETE, FileAttributes.Normal, ShareAccess.None, CreateDisposition.FILE_OPEN,
+          CreateOptions.FILE_NON_DIRECTORY_FILE, null);
+      ThrowIfFailed(status, "open temporary file for deletion", path);
+      try
+      {
+        status = connection.FileStore.SetFileInformation(handle, new FileDispositionInformation { DeletePending = true });
+        ThrowIfFailed(status, "delete temporary file", path);
+      }
+      finally
+      {
+        connection.FileStore.CloseFile(handle);
+      }
     }
 
     private void UploadData(Stream data, SmbConnectionInfo uploadPath)
@@ -392,29 +455,28 @@ namespace Kp2aBusinessLogic.Io
       var status = connection.FileStore!.CreateFile(out var fileHandle, out _, uploadPath.GetLocalSmbPath(), AccessMask.GENERIC_WRITE | AccessMask.SYNCHRONIZE, FileAttributes.Normal, ShareAccess.None, CreateDisposition.FILE_CREATE, CreateOptions.FILE_NON_DIRECTORY_FILE | CreateOptions.FILE_SYNCHRONOUS_IO_ALERT, null);
       if (status == NTStatus.STATUS_OBJECT_NAME_COLLISION)
         status = connection.FileStore!.CreateFile(out fileHandle, out _, uploadPath.GetLocalSmbPath(), AccessMask.GENERIC_WRITE | AccessMask.SYNCHRONIZE, FileAttributes.Normal, ShareAccess.None, CreateDisposition.FILE_OVERWRITE, CreateOptions.FILE_NON_DIRECTORY_FILE | CreateOptions.FILE_SYNCHRONOUS_IO_ALERT, null);
-      if (status != NTStatus.STATUS_SUCCESS)
+      ThrowIfFailed(status, "open file for writing", uploadPath);
+      try
       {
-        throw new Exception($"Failed to open {uploadPath.LocalPath} for writing!");
-      }
+        long writeOffset = 0;
+        while (data.Position < data.Length)
+        {
+          byte[] buffer = new byte[(int)connection.Client.MaxWriteSize];
+          int bytesRead = data.Read(buffer, 0, buffer.Length);
+          if (bytesRead < (int)connection.Client.MaxWriteSize)
+          {
+            Array.Resize(ref buffer, bytesRead);
+          }
 
-      long writeOffset = 0;
-      while (data.Position < data.Length)
+          status = connection.FileStore.WriteFile(out _, fileHandle, writeOffset, buffer);
+          ThrowIfFailed(status, "write file", uploadPath);
+          writeOffset += bytesRead;
+        }
+      }
+      finally
       {
-        byte[] buffer = new byte[(int)connection.Client.MaxWriteSize];
-        int bytesRead = data.Read(buffer, 0, buffer.Length);
-        if (bytesRead < (int)connection.Client.MaxWriteSize)
-        {
-          Array.Resize(ref buffer, bytesRead);
-        }
-
-        status = connection.FileStore.WriteFile(out _, fileHandle, writeOffset, buffer);
-        if (status != NTStatus.STATUS_SUCCESS)
-        {
-          throw new Exception("Failed to write to file");
-        }
-        writeOffset += bytesRead;
+        connection.FileStore.CloseFile(fileHandle);
       }
-
     }
 
     public IWriteTransaction OpenWriteTransaction(IOConnectionInfo ioc, bool useFileTransaction)
@@ -472,22 +534,26 @@ namespace Kp2aBusinessLogic.Io
       }
 
       NTStatus status = conn.FileStore!.CreateFile(out var directoryHandle, out _, info.GetLocalSmbPath(), AccessMask.GENERIC_READ, FileAttributes.Directory, ShareAccess.Read | ShareAccess.Write, CreateDisposition.FILE_OPEN, CreateOptions.FILE_DIRECTORY_FILE, null);
-      if (status == NTStatus.STATUS_SUCCESS)
+      ThrowIfFailed(status, "open directory", info);
+      try
       {
-        conn.FileStore.QueryDirectory(out List<QueryDirectoryFileInformation> fileList, directoryHandle, "*", FileInformationClass.FileDirectoryInformation);
+        status = conn.FileStore.QueryDirectory(out List<QueryDirectoryFileInformation> fileList, directoryHandle, "*", FileInformationClass.FileDirectoryInformation);
+        // SMBLibrary returns NO_MORE_FILES after collecting all pages, or NO_SUCH_FILE for no matches.
+        if (status != NTStatus.STATUS_NO_MORE_FILES && status != NTStatus.STATUS_NO_SUCH_FILE)
+          ThrowIfFailed(status, "list directory", info);
         foreach (var fi in fileList)
         {
-          var fileDirectoryInformation = fi as FileDirectoryInformation;
-          if (fileDirectoryInformation == null)
+          if (fi is not FileDirectoryInformation fileDirectoryInformation)
             continue;
 
           if (fileDirectoryInformation.FileName is "." or "..")
             continue;
 
-          var fileDescription = FileDescriptionConvert(ioc, fileDirectoryInformation);
-
-          result.Add(fileDescription);
+          result.Add(FileDescriptionConvert(ioc, fileDirectoryInformation));
         }
+      }
+      finally
+      {
         conn.FileStore.CloseFile(directoryHandle);
       }
 
@@ -529,24 +595,32 @@ namespace Kp2aBusinessLogic.Io
 
       using SmbConnection conn = new SmbConnection(info);
       NTStatus status = conn.FileStore!.CreateFile(out var directoryHandle, out _, info.GetParent().GetLocalSmbPath(), AccessMask.GENERIC_READ, FileAttributes.Directory, ShareAccess.Read | ShareAccess.Write, CreateDisposition.FILE_OPEN, CreateOptions.FILE_DIRECTORY_FILE, null);
-      if (status != NTStatus.STATUS_SUCCESS) throw new Exception($"Failed to query details for {info.LocalPath}");
-      conn.FileStore.QueryDirectory(out List<QueryDirectoryFileInformation> fileList, directoryHandle, info.Stem(), FileInformationClass.FileDirectoryInformation);
-      foreach (var fi in fileList)
+      ThrowIfFailed(status, "open directory for file details", info);
+      try
       {
-        var fileDirectoryInformation = fi as FileDirectoryInformation;
-        if (fileDirectoryInformation == null)
-          continue;
+        status = conn.FileStore.QueryDirectory(out List<QueryDirectoryFileInformation> fileList, directoryHandle, info.Stem(), FileInformationClass.FileDirectoryInformation);
+        if (status != NTStatus.STATUS_NO_SUCH_FILE)
+        {
+          if (status != NTStatus.STATUS_NO_MORE_FILES)
+            ThrowIfFailed(status, "query file details", info);
+          foreach (var fi in fileList)
+          {
+            if (fi is not FileDirectoryInformation fileDirectoryInformation)
+              continue;
 
-        if (fileDirectoryInformation.FileName is "." or "..")
-          continue;
+            if (fileDirectoryInformation.FileName is "." or "..")
+              continue;
 
-        return FileDescriptionConvert(ioc, fileDirectoryInformation);
-
-
+            return FileDescriptionConvert(ioc, fileDirectoryInformation);
+          }
+        }
       }
-      conn.FileStore.CloseFile(directoryHandle);
+      finally
+      {
+        conn.FileStore.CloseFile(directoryHandle);
+      }
 
-      throw new Exception($"Failed to query details for {info.LocalPath}");
+      throw new FileNotFoundException($"File not found: {info.GetPathWithoutCredentials()}");
     }
 
     public bool RequiresSetup(IOConnectionInfo ioConnection)

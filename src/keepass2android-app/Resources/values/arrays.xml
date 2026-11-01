@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string-array name="keeshare_types">
+    <item>@string/keeshare_type_inactive</item>
+    <item>@string/keeshare_type_import</item>
+    <item>@string/keeshare_type_export</item>
+    <item>@string/keeshare_type_synchronize</item>
+  </string-array>
+</resources>

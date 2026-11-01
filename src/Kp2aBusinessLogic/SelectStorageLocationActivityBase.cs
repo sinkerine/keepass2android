@@ -186,8 +186,19 @@ namespace keepass2android
     protected abstract bool IsStorageSelectionForSave { get; }
 
 
+    // Save selection must never enter the open-file copy-to-writable-location workflow.
+    protected virtual void SaveIocSelected(IOConnectionInfo ioc)
+    {
+      ReturnCancel();
+    }
+
     protected void IocSelected(IOConnectionInfo ioc, int requestCode)
     {
+      if (IsStorageSelectionForSave)
+      {
+        SaveIocSelected(ioc);
+        return;
+      }
       if (requestCode == RequestCodeFileFileBrowseForWritableLocation)
       {
         IocForCopySelected(ioc);

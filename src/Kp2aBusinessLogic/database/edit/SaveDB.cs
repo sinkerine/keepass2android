@@ -48,6 +48,7 @@ namespace keepass2android
     private bool requiresSubsequentSync = false; //if true, we need to sync the file after saving.
 
     public bool DoNotSetStatusLoggerMessage = false;
+    public bool SkipKeeShareExport { get; set; }
 
     /// <summary>
     /// stream for reading the data from the original file. If this is set to a non-null value, we know we need to sync
@@ -246,6 +247,8 @@ namespace keepass2android
         _db.LastSyncTime = DateTime.Now;
 
       }
+      if (!SkipKeeShareExport)
+        KeeShare.KeeShareScheduler.Enqueue(_app, _db, KeeShare.KeeShareSyncMode.Export);
       Finish(true);
     }
 

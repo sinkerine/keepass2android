@@ -35,6 +35,7 @@ using Android.Preferences;
 using Android.Runtime;
 using Google.Android.Material.Dialog;
 using keepass2android.Io;
+using keepass2android.KeeShare;
 using keepass2android;
 using KeePassLib.Security;
 using AlertDialog = Android.App.AlertDialog;
@@ -96,16 +97,23 @@ namespace keepass2android
     public override void SetupNormalButtons()
     {
       SetNormalButtonVisibility(AddGroupEnabled, AddEntryEnabled);
+      var info = FindViewById(Resource.Id.keeshare_readonly_info);
+      if (info != null)
+        info.Visibility = IsReadOnlyImport ? ViewStates.Visible : ViewStates.Gone;
     }
+
+    private Database OwningDatabase => GroupListFragment.FindOwningDatabase(Group);
+
+    private bool IsReadOnlyImport => OwningDatabase is Database db && KeeShareGroups.IsReadOnlyContent(db, Group);
 
     protected override bool AddEntryEnabled
     {
-      get { return App.Kp2a.CurrentDb.CanWrite && ((this.Group.ParentGroup != null) || App.Kp2a.CurrentDb.DatabaseFormat.CanHaveEntriesInRootGroup); }
+      get { return OwningDatabase is Database db && db.CanWrite && !IsReadOnlyImport && ((this.Group.ParentGroup != null) || db.DatabaseFormat.CanHaveEntriesInRootGroup); }
     }
 
     protected override bool AddGroupEnabled
     {
-      get { return App.Kp2a.CurrentDb.CanWrite; }
+      get { return OwningDatabase?.CanWrite == true && !IsReadOnlyImport; }
     }
 
     private class TemplateListAdapter : ArrayAdapter<PwEntry>
@@ -213,7 +221,8 @@ namespace keepass2android
         View addGroup = FindViewById(Resource.Id.fabAddNewGroup);
         addGroup.Click += (sender, e) =>
         {
-          GroupEditActivity.Launch(this, Group);
+          if (AddGroupEnabled)
+            GroupEditActivity.Launch(this, Group);
         };
       }
 
@@ -223,6 +232,7 @@ namespace keepass2android
         View addEntry = FindViewById(Resource.Id.fabAddNewEntry);
         addEntry.Click += (sender, e) =>
         {
+          if (!AddEntryEnabled) return;
           if (App.Kp2a.CurrentDb.DatabaseFormat.SupportsTemplates &&
                       !AddTemplateEntries.ContainsAllTemplates(App.Kp2a.CurrentDb) &&
                       PreferenceManager.GetDefaultSharedPreferences(this).GetBoolean(Askaddtemplates, true))
@@ -252,6 +262,7 @@ namespace keepass2android
 
       }
 
+      SetupNormalButtons();
       SetGroupTitle();
       SetGroupIcon();
 
@@ -263,6 +274,7 @@ namespace keepass2android
 
     private void StartAddEntry()
     {
+      if (!AddEntryEnabled) return;
       PwEntry defaultTemplate = new PwEntry(false, false);
       defaultTemplate.IconId = PwIcon.Key;
       defaultTemplate.Strings.Set(PwDefs.TitleField, new ProtectedString(false, GetString(Resource.String.DefaultTemplate)));
@@ -304,7 +316,7 @@ namespace keepass2android
 
     public override ElementAndDatabaseId FullGroupId
     {
-      get { return new ElementAndDatabaseId(App.Kp2a.FindDatabaseForElement(Group), Group); }
+      get { return new ElementAndDatabaseId(OwningDatabase, Group); }
     }
 
     public override void OnBackPressed()

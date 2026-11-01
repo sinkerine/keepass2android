@@ -18,6 +18,7 @@ using Android.Content;
 using Android.OS;
 using Android.Widget;
 using keepass2android.Io;
+using keepass2android.KeeShare;
 using KeePassLib.Serialization;
 using System;
 using AndroidX.Preference;
@@ -74,6 +75,16 @@ namespace keepass2android
     /// <param name="forceSynchronization">If true, sync is always started. If false, we respect the background sync options from preferences.</param>
     public void StartSynchronizeDatabase(Database database, bool forceSynchronization)
     {
+      // Capture reload intent and enqueue the operation in one UI turn, before
+      // a fast dialog decision can intervene. Never wait on the operation worker.
+      if (Looper.MyLooper() != Looper.MainLooper)
+      {
+        App.Kp2a.UiThreadHandler.Post(() => StartSynchronizeDatabase(database, forceSynchronization));
+        return;
+      }
+      if (!App.Kp2a.IsReloadTargetOpen(database))
+        return;
+
       if (!forceSynchronization)
       {
         ISharedPreferences prefs = PreferenceManager.GetDefaultSharedPreferences(App.Context);
@@ -103,6 +114,8 @@ namespace keepass2android
 
 
       OperationWithFinishHandler task;
+      CheckDatabaseForChanges changeCheck = null;
+      var reloadRequest = filestorage is CachingFileStorage ? null : App.Kp2a.BindReloadCheck(database);
       //Deliberately not an ActionInContextInstanceOnOperationFinished: nothing in here needs the
       //activity which started the synchronization. ShowMessage ignores the context and queues the
       //message if no UI is attached, the list refresh applies to whichever group list is on screen,
@@ -120,6 +133,17 @@ namespace keepass2android
                 BaseAdapter adapter = (context as GroupBaseActivity)?.ListAdapter;
 
                 adapter?.NotifyDataSetChanged();
+
+                bool reloadHandled = reloadRequest?.Complete(success) == true;
+                if (success && !reloadHandled && changeCheck?.ReloadPending != true)
+                {
+                  // Cached sync can replace the instance; a non-cached check only validates
+                  // the captured instance. Reload-pending checks resume through the open result.
+                  var syncedDatabase = App.Kp2a.TryGetDatabase(ioc);
+                  if (syncedDatabase != null &&
+                      (changeCheck == null || ReferenceEquals(syncedDatabase, database)))
+                    KeeShareScheduler.Enqueue(App.Kp2a, syncedDatabase, KeeShareSyncMode.Both);
+                }
               });
 
         if (database?.OtpAuxFileIoc != null)
@@ -138,7 +162,9 @@ namespace keepass2android
       }
       else
       {
-        task = new CheckDatabaseForChanges(App.Kp2a, onOperationFinishedHandler);
+        changeCheck = new CheckDatabaseForChanges(App.Kp2a, database, onOperationFinishedHandler,
+            reloadRequest.OnReloadRequired);
+        task = changeCheck;
       }
 
       OperationRunner.Instance.Run(App.Kp2a, task);
@@ -147,6 +173,11 @@ namespace keepass2android
 
     public void TryStartPendingSyncs()
     {
+      if (Looper.MyLooper() != Looper.MainLooper)
+      {
+        App.Kp2a.UiThreadHandler.Post(TryStartPendingSyncs);
+        return;
+      }
       var prefs = PreferenceManager.GetDefaultSharedPreferences(_activity);
       string periodic_sync_default = _activity.GetString(Resource.String.pref_periodic_background_sync_interval_default);
       foreach (var db in App.Kp2a.OpenDatabases)

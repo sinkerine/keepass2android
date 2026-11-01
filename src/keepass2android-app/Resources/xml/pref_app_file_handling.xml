@@ -38,6 +38,18 @@
 
 
     <CheckBoxPreference
+        android:key="keeshare_import_enabled"
+        android:title="@string/keeshare_import_title"
+        android:summary="@string/keeshare_import_summary"
+        android:defaultValue="true" />
+
+    <CheckBoxPreference
+        android:key="keeshare_export_enabled"
+        android:title="@string/keeshare_export_title"
+        android:summary="@string/keeshare_export_summary"
+        android:defaultValue="true" />
+
+    <CheckBoxPreference
         android:key="pref_enable_periodic_background_sync"
         android:title="@string/pref_enable_periodic_background_sync_title"
         android:summary="@string/pref_enable_periodic_background_sync_summary"

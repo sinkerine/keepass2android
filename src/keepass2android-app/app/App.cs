@@ -17,6 +17,8 @@ This file is part of Keepass2Android, Copyright 2013 Philipp Crocoll. This file 
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Threading;
 using System.ComponentModel.Design;
 using System.IO;
 using System.Linq;
@@ -127,52 +129,63 @@ namespace keepass2android
   {
     public void Lock(bool allowQuickUnlock = true, bool lockWasTriggeredByTimeout = false)
     {
-      if (OpenDatabases.Any())
+      // Keep dispatch/acceptance invalid until the worker has published the lock
+      // state as well as scheduled UI cleanup.
+      Interlocked.Increment(ref _reloadInvalidationsPending);
+      try
       {
-        if (QuickUnlockEnabled && allowQuickUnlock &&
-            GetDbForQuickUnlock().KpDatabase.MasterKey.ContainsType(typeof(KcpPassword)) &&
-            !((KcpPassword)App.Kp2a.GetDbForQuickUnlock().KpDatabase.MasterKey.GetUserKey(typeof(KcpPassword))).Password.IsEmpty)
+        ClearReloadRequests();
+        if (OpenDatabases.Any())
         {
-          if (!QuickLocked)
+          if (QuickUnlockEnabled && allowQuickUnlock &&
+              GetDbForQuickUnlock().KpDatabase.MasterKey.ContainsType(typeof(KcpPassword)) &&
+              !((KcpPassword)App.Kp2a.GetDbForQuickUnlock().KpDatabase.MasterKey.GetUserKey(typeof(KcpPassword))).Password.IsEmpty)
           {
-            Kp2aLog.Log("QuickLocking database");
-            QuickLocked = true;
-            LastOpenedEntry = null;
-            BroadcastDatabaseAction(LocaleManager.LocalizedAppContext, Strings.ActionLockDatabase);
+            if (!QuickLocked)
+            {
+              Kp2aLog.Log("QuickLocking database");
+              QuickLocked = true;
+              LastOpenedEntry = null;
+              BroadcastDatabaseAction(LocaleManager.LocalizedAppContext, Strings.ActionLockDatabase);
+            }
+            else
+            {
+              Kp2aLog.Log("Database already QuickLocked");
+            }
           }
           else
           {
-            Kp2aLog.Log("Database already QuickLocked");
+            Kp2aLog.Log("Locking database");
+
+            BroadcastDatabaseAction(LocaleManager.LocalizedAppContext, Strings.ActionCloseDatabase);
+
+            // Couldn't quick-lock, so unload database(s) instead
+            _openAttempts.Clear();
+            _openDatabases.Clear();
+
+            _currentDatabase = null;
+            LastOpenedEntry = null;
+            QuickLocked = false;
+
+
           }
         }
         else
         {
-          Kp2aLog.Log("Locking database");
-
-          BroadcastDatabaseAction(LocaleManager.LocalizedAppContext, Strings.ActionCloseDatabase);
-
-          // Couldn't quick-lock, so unload database(s) instead
-          _openAttempts.Clear();
-          _openDatabases.Clear();
-
-          _currentDatabase = null;
-          LastOpenedEntry = null;
-          QuickLocked = false;
-
-
+          Kp2aLog.Log("Database not loaded, couldn't lock");
         }
-      }
-      else
-      {
-        Kp2aLog.Log("Database not loaded, couldn't lock");
-      }
-      _currentlyWaitingXcKey = null;
+        _currentlyWaitingXcKey = null;
 
-      UpdateOngoingNotification();
-      var intent = new Intent(Intents.DatabaseLocked);
-      if (lockWasTriggeredByTimeout)
-        intent.PutExtra("ByTimeout", true);
-      LocaleManager.LocalizedAppContext.SendBroadcast(intent);
+        UpdateOngoingNotification();
+        var intent = new Intent(Intents.DatabaseLocked);
+        if (lockWasTriggeredByTimeout)
+          intent.PutExtra("ByTimeout", true);
+        LocaleManager.LocalizedAppContext.SendBroadcast(intent);
+      }
+      finally
+      {
+        Interlocked.Decrement(ref _reloadInvalidationsPending);
+      }
     }
 
 
@@ -246,8 +259,10 @@ namespace keepass2android
               _currentDatabase = newDb;
             }
 
+            var replacedDatabase = _openDatabases[i];
             replacedOpenDatabase = true;
             _openDatabases[i] = newDb;
+            CancelReloadRequest(replacedDatabase);
 
             break;
           }
@@ -335,6 +350,7 @@ namespace keepass2android
       }
 
       _openDatabases.Remove(db);
+      CancelReloadRequest(db);
       if (_currentDatabase == db)
         _currentDatabase = _openDatabases.First();
 
@@ -511,6 +527,10 @@ namespace keepass2android
           return prefs.GetBoolean(ctx.Resources.GetString(Resource.String.UseFileTransactions_key), true);
         case PreferenceKey.CheckForFileChangesOnSave:
           return prefs.GetBoolean(ctx.Resources.GetString(Resource.String.CheckForFileChangesOnSave_key), true);
+        case PreferenceKey.keeshare_import_enabled:
+          return prefs.GetBoolean("keeshare_import_enabled", true);
+        case PreferenceKey.keeshare_export_enabled:
+          return prefs.GetBoolean("keeshare_export_enabled", true);
         default:
           throw new Exception("unexpected key!");
       }
@@ -520,18 +540,21 @@ namespace keepass2android
 
     public void CheckForOpenFileChanged(Activity activity)
     {
-      if (CurrentDb?.DidOpenFileChange() == true)
+      if (Looper.MyLooper() != Looper.MainLooper)
       {
-        if (CurrentDb.ReloadRequested)
+        UiThreadHandler.Post(() => CheckForOpenFileChanged(activity));
+        return;
+      }
+      var database = CurrentDb;
+      if (IsReloadTargetOpen(database) && database?.DidOpenFileChange() == true)
+      {
+        if (_reloadRequests.TryGetValue(database, out var request) && request.Accepted)
         {
-          activity.SetResult(KeePass.ExitReloadDb);
+          SetReloadResult(activity, request);
           activity.Finish();
         }
         else
-        {
-          AskForReload(activity, null);
-        }
-
+          AskForReload(activity, null, database);
       }
     }
 
@@ -542,63 +565,348 @@ namespace keepass2android
     private YesNoCancelQuestion? _currentlyPendingYesNoCancelQuestion = null;
     private Context? _activeContext;
 
-    private void AskForReload(Activity activity, Action<bool> actionOnResult)
+    internal const string ReloadRequestIdExtra = "ReloadRequestId";
+    // Requests, dialogs and PendingChecks belong to the UI thread. Workers only
+    // publish invalidation and read the decision counters before posting callbacks.
+    private readonly Dictionary<Database, ReloadRequest> _reloadRequests = new Dictionary<Database, ReloadRequest>();
+    // Changed unbound checks retain only their exact target and validation counters,
+    // never the finishing host. ActiveContext publication retries delivery after resume.
+    private readonly Dictionary<Database, ReloadCheckRequest> _pendingChangedReloadChecks = new Dictionary<Database, ReloadCheckRequest>();
+    private bool _pendingChangedReloadDeliveryPosted;
+    private int _reloadGeneration;
+    private int _reloadInvalidationsPending;
+    private readonly ConcurrentDictionary<Database, int> _reloadDecisions = new ConcurrentDictionary<Database, int>();
+
+    private int ReloadGeneration => Volatile.Read(ref _reloadGeneration);
+
+    private static void RequireReloadUiThread()
     {
+      if (Looper.MyLooper() != Looper.MainLooper)
+        throw new InvalidOperationException("Reload request state requires the UI thread.");
+    }
+
+    private int ReloadDecision(Database database) =>
+        _reloadDecisions.TryGetValue(database, out var decision) ? decision : 0;
+
+    internal bool IsReloadTargetOpen(Database? database) =>
+        Volatile.Read(ref _reloadInvalidationsPending) == 0 && DatabaseIsUnlocked &&
+        OpenDatabases.Any(db => ReferenceEquals(db, database));
+
+    private bool IsReloadActivityActive(Activity activity) =>
+        !activity.IsFinishing && !activity.IsDestroyed && ReferenceEquals(ActiveContext, activity) &&
+        (activity is not LifecycleAwareActivity lifecycleActivity ||
+            lifecycleActivity.Lifecycle.CurrentState.IsAtLeast(Lifecycle.State.Started));
+
+    // The request outlives its dialog only after acceptance. Drop all Activity and
+    // callback references before passing its identity through the activity result chain.
+    internal sealed class ReloadRequest : Java.Lang.Object, Application.IActivityLifecycleCallbacks
+    {
+      private readonly Kp2aApp _app;
+      internal readonly Database Database;
+      internal readonly string Id = Guid.NewGuid().ToString();
+      internal Activity? Activity;
+      internal Dialog? Dialog;
+      internal bool Accepted;
+      internal bool SynchronizeKeeShare;
+      internal readonly HashSet<object> PendingChecks = new HashSet<object>();
+      internal readonly List<Action<bool>> Callbacks = new List<Action<bool>>();
+
+      internal ReloadRequest(Kp2aApp app, Database database, Activity activity)
+      {
+        _app = app;
+        Database = database;
+        Activity = activity;
+        activity.Application!.RegisterActivityLifecycleCallbacks(this);
+      }
+
+      public void OnActivityStopped(Activity activity)
+      {
+        if (ReferenceEquals(Activity, activity))
+          _app.CompleteReloadRequest(this, false);
+      }
+      public void OnActivityDestroyed(Activity activity) => OnActivityStopped(activity);
+      public void OnActivityCreated(Activity activity, Bundle? savedInstanceState) { }
+      public void OnActivityStarted(Activity activity) { }
+      public void OnActivityResumed(Activity activity) { }
+      public void OnActivityPaused(Activity activity) { }
+      public void OnActivitySaveInstanceState(Activity activity, Bundle outState) { }
+
+      internal void DetachDialog()
+      {
+        Activity?.Application?.UnregisterActivityLifecycleCallbacks(this);
+        Activity = null;
+        var dialog = Dialog;
+        Dialog = null;
+        dialog?.Dismiss();
+      }
+    }
+
+    private static void SetReloadResult(Activity activity, ReloadRequest request)
+    {
+      activity.SetResult(KeePass.ExitReloadDb,
+          new Intent().PutExtra(ReloadRequestIdExtra, request.Id));
+    }
+
+    internal Database? TakeRequestedReload(string? requestId, out bool synchronizeKeeShare)
+    {
+      RequireReloadUiThread();
+      var request = _reloadRequests.Values.FirstOrDefault(r => r.Id == requestId && r.Accepted);
+      synchronizeKeeShare = false;
+      if (request == null)
+        return null;
+      _reloadRequests.Remove(request.Database);
+      request.Database.ReloadRequested = false;
+      if (!IsReloadTargetOpen(request.Database))
+        return null;
+      synchronizeKeeShare = request.SynchronizeKeeShare;
+      return request.Database;
+    }
+
+    private void CancelReloadRequest(Database database)
+    {
+      if (Looper.MyLooper() != Looper.MainLooper)
+      {
+        UiThreadHandler.Post(() => CancelReloadRequest(database));
+        return;
+      }
+      _pendingChangedReloadChecks.Remove(database);
+      if (_reloadRequests.TryGetValue(database, out var request))
+        CompleteReloadRequest(request, false);
+      _reloadDecisions.TryRemove(database, out _);
+    }
+
+    private void ClearReloadRequests()
+    {
+      // Lock can run inside a worker's database writer lock. Invalidate now,
+      // then clean Android UI without waiting for that worker or taking its lock.
+      Interlocked.Increment(ref _reloadInvalidationsPending);
+      Interlocked.Increment(ref _reloadGeneration);
+      if (Looper.MyLooper() != Looper.MainLooper)
+        UiThreadHandler.Post(ClearReloadRequestsOnUiThread);
+      else
+        ClearReloadRequestsOnUiThread();
+    }
+
+    private void ClearReloadRequestsOnUiThread()
+    {
+      RequireReloadUiThread();
+      try
+      {
+        _pendingChangedReloadChecks.Clear();
+        foreach (var request in _reloadRequests.Values.ToList())
+          CompleteReloadRequest(request, false);
+        _reloadDecisions.Clear();
+      }
+      finally
+      {
+        Interlocked.Decrement(ref _reloadInvalidationsPending);
+      }
+    }
+
+    private void CompleteReloadRequest(ReloadRequest request, bool accepted)
+    {
+      RequireReloadUiThread();
+      if (!_reloadRequests.TryGetValue(request.Database, out var current) || !ReferenceEquals(current, request))
+        return;
+      var activity = request.Activity;
+      _pendingChangedReloadChecks.Remove(request.Database);
+      _reloadDecisions.AddOrUpdate(request.Database, 1, (_, decision) => decision + 1);
+      accepted = accepted && IsReloadTargetOpen(request.Database) &&
+          activity != null && IsReloadActivityActive(activity);
+      request.SynchronizeKeeShare |= accepted && request.PendingChecks.Count != 0;
+      request.PendingChecks.Clear();
+      request.Accepted = accepted;
+      request.Database.ReloadRequested = accepted;
+      if (!accepted)
+        _reloadRequests.Remove(request.Database);
+      var callbacks = request.Callbacks.ToList();
+      request.Callbacks.Clear();
+      bool hadDialog = request.Dialog != null;
+      request.DetachDialog();
+      if (hadDialog && !_reloadRequests.Values.Any(r => r.Dialog != null))
+        OnUserInputDialogClose();
+      if (accepted)
+      {
+        SetReloadResult(activity!, request);
+        activity!.Finish();
+      }
+      foreach (var callback in callbacks)
+        callback(accepted);
+    }
+
+    // Bind at sync dispatch, before a fast decision can remove the foreground
+    // prompt. A late change-check callback belongs to this request, never its successor.
+    internal sealed class ReloadCheckRequest
+    {
+      private readonly Kp2aApp _app;
+      private readonly Database _database;
+      private readonly int _generation;
+      private readonly int _decision;
+      private readonly ReloadRequest? _request;
+
+      internal ReloadCheckRequest(Kp2aApp app, Database database)
+      {
+        RequireReloadUiThread();
+        _app = app;
+        _database = database;
+        _generation = app.ReloadGeneration;
+        _decision = app.ReloadDecision(database);
+        if (app._reloadRequests.TryGetValue(database, out _request))
+        {
+          if (_request.Accepted)
+            _request.SynchronizeKeeShare = true;
+          else
+            _request.PendingChecks.Add(this);
+        }
+      }
+
+      internal bool IsCurrent => _generation == _app.ReloadGeneration &&
+          _decision == _app.ReloadDecision(_database) && _app.IsReloadTargetOpen(_database);
+
+      internal void OnReloadRequired(Database database)
+      {
+        _app.UiThreadHandler.Post(() =>
+        {
+          if (!ReferenceEquals(database, _database) || _generation != _app.ReloadGeneration ||
+              !_app.IsReloadTargetOpen(database))
+            return;
+          if (_request != null)
+          {
+            if (_app._reloadRequests.TryGetValue(database, out var current) && ReferenceEquals(current, _request))
+              _request.SynchronizeKeeShare = true;
+            return;
+          }
+          if (_decision != _app.ReloadDecision(database))
+            return;
+          if (_app._reloadRequests.TryGetValue(database, out var pending))
+          {
+            // Coalesce now, before a fast decision can run ahead of delivery.
+            pending.SynchronizeKeeShare = true;
+            return;
+          }
+          _app._pendingChangedReloadChecks[database] = this;
+          _app.PostPendingChangedReloadDelivery();
+        });
+      }
+
+      // Runs on the UI thread with the operation result. Failed checks relinquish
+      // provisional intent; an accepted request has already consumed that intent.
+      internal bool Complete(bool success)
+      {
+        RequireReloadUiThread();
+        if (_generation != _app.ReloadGeneration || !_app.IsReloadTargetOpen(_database))
+          return true;
+        if (_request == null)
+        {
+          if (_decision != _app.ReloadDecision(_database))
+            return true;
+          if (!_app._reloadRequests.TryGetValue(_database, out var pending))
+            return _app._pendingChangedReloadChecks.TryGetValue(_database, out var changed) && changed.IsCurrent;
+          pending.SynchronizeKeeShare |= success;
+          return true;
+        }
+        _request.PendingChecks.Remove(this);
+        if (success && _app._reloadRequests.TryGetValue(_database, out var current) && ReferenceEquals(current, _request))
+          _request.SynchronizeKeeShare = true;
+        return true;
+      }
+    }
+
+    internal ReloadCheckRequest BindReloadCheck(Database database) => new ReloadCheckRequest(this, database);
+
+    private void PostPendingChangedReloadDelivery()
+    {
+      RequireReloadUiThread();
+      if (_pendingChangedReloadChecks.Count == 0 || _pendingChangedReloadDeliveryPosted)
+        return;
+      _pendingChangedReloadDeliveryPosted = true;
+      // OnStart/OnResume publish context before the complete Activity callback
+      // (including lock checks/navigation). One coalesced post runs after it returns.
+      UiThreadHandler.Post(DeliverPendingChangedReloadChecks);
+    }
+
+    private void DeliverPendingChangedReloadChecks()
+    {
+      RequireReloadUiThread();
+      _pendingChangedReloadDeliveryPosted = false;
+      foreach (var pending in _pendingChangedReloadChecks.ToList())
+      {
+        if (!pending.Value.IsCurrent)
+        {
+          _pendingChangedReloadChecks.Remove(pending.Key);
+          continue;
+        }
+        if (_reloadRequests.TryGetValue(pending.Key, out var request))
+        {
+          request.SynchronizeKeeShare = true;
+          _pendingChangedReloadChecks.Remove(pending.Key);
+          continue;
+        }
+        if (ActiveContext is not LifecycleAwareActivity activity ||
+            !IsReloadActivityActive(activity) ||
+            !activity.Lifecycle.CurrentState.IsAtLeast(Lifecycle.State.Resumed))
+          continue;
+
+        // Remove before showing: delivery is one-shot and the prompt now owns Both.
+        _pendingChangedReloadChecks.Remove(pending.Key);
+        AskForReload(activity, null, pending.Key, true);
+      }
+      // An unusable host waits for the next context publication; never self-post.
+    }
+
+    private void AskForReload(Activity activity, Action<bool>? actionOnResult,
+        Database? database, bool synchronizeKeeShare = false)
+    {
+      RequireReloadUiThread();
+      if (!IsReloadTargetOpen(database) || !IsReloadActivityActive(activity))
+      {
+        actionOnResult?.Invoke(false);
+        return;
+      }
+      // A foreground change notification can create the prompt before retained
+      // delivery runs. Transfer its validated Both intent into that same prompt.
+      if (_pendingChangedReloadChecks.Remove(database!, out var changed))
+        synchronizeKeeShare |= changed.IsCurrent;
+      if (_reloadRequests.TryGetValue(database!, out var request))
+      {
+        request.SynchronizeKeeShare |= synchronizeKeeShare;
+        if (request.Accepted)
+          actionOnResult?.Invoke(true);
+        else if (actionOnResult != null)
+          request.Callbacks.Add(actionOnResult);
+        return;
+      }
+
+      request = new ReloadRequest(this, database!, activity);
+      request.SynchronizeKeeShare = synchronizeKeeShare;
+      if (actionOnResult != null)
+        request.Callbacks.Add(actionOnResult);
+      _reloadRequests.Add(database!, request);
       MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(activity);
       builder.SetTitle(activity.GetString(Resource.String.AskReloadFile_title));
-
       builder.SetMessage(activity.GetString(Resource.String.AskReloadFile));
-
-      bool buttonPressed = false;
-
       builder.SetPositiveButton(activity.GetString(Android.Resource.String.Yes),
-          (dlgSender, dlgEvt) =>
-          {
-            buttonPressed = true;
-            CurrentDb.ReloadRequested = true;
-            activity.SetResult(KeePass.ExitReloadDb);
-            activity.Finish();
-            if (actionOnResult != null)
-            {
-              actionOnResult(true);
-              actionOnResult = null;
-            }
-
-            OnUserInputDialogClose();
-          });
-
-      builder.SetNegativeButton(activity.GetString(Android.Resource.String.No), (dlgSender, dlgEvt) =>
+          (sender, args) => CompleteReloadRequest(request, true));
+      builder.SetNegativeButton(activity.GetString(Android.Resource.String.No),
+          (sender, args) => CompleteReloadRequest(request, false));
+      request.Dialog = builder.Create();
+      request.Dialog.SetOnDismissListener(new Util.DismissListener(() =>
       {
-        buttonPressed = true;
-        if (actionOnResult != null)
-        {
-          actionOnResult(false);
-          actionOnResult = null;
-        }
-
-        OnUserInputDialogClose();
-      });
-
-      Dialog dialog = builder.Create();
-
-      dialog.SetOnDismissListener(new Util.DismissListener(() =>
-      {
-        //dismiss can be called when we're calling activity.Finish() during button press.
-        //don't do anything then.
-        if (buttonPressed)
-          return;
-
-        if (actionOnResult != null)
-        {
-          actionOnResult(false);
-          actionOnResult = null;
-        }
-
-        OnUserInputDialogClose();
+        // DetachDialog clears Dialog first, so programmatic dismissal cannot
+        // undo acceptance or complete the same callbacks a second time.
+        if (request.Dialog != null)
+          CompleteReloadRequest(request, false);
       }));
-
       OnUserInputDialogShow();
-      dialog.Show();
+      try
+      {
+        request.Dialog.Show();
+      }
+      catch
+      {
+        CompleteReloadRequest(request, false);
+        throw;
+      }
     }
 
     public void StoreOpenedFileAsRecent(IOConnectionInfo ioc, string keyfile, bool updateTimestamp, string displayName = "")
@@ -1030,14 +1338,21 @@ namespace keepass2android
 
     public void TriggerReload(Context ctx, Action<bool> actionOnResult)
     {
-      Handler handler = new Handler(Looper.MainLooper);
-      handler.Post(() =>
-          {
-            var activity = (ctx as Activity) ?? (ActiveContext as Activity);
-            if (activity == null)
-              return;
-            AskForReload(activity, actionOnResult);
-          });
+      var database = CurrentDb;
+      var generation = ReloadGeneration;
+      var invalidationPending = Volatile.Read(ref _reloadInvalidationsPending) != 0;
+      var decision = database == null ? 0 : ReloadDecision(database);
+      UiThreadHandler.Post(() =>
+      {
+        var activity = (ctx as Activity) ?? (ActiveContext as Activity);
+        if (activity == null || invalidationPending || generation != ReloadGeneration ||
+            (database != null && decision != ReloadDecision(database)))
+        {
+          actionOnResult?.Invoke(false);
+          return;
+        }
+        AskForReload(activity, actionOnResult, database);
+      });
     }
 
     public bool AlwaysFailOnValidationError()
@@ -1165,6 +1480,7 @@ namespace keepass2android
     internal void OnTerminate()
     {
 
+      ClearReloadRequests();
       _openDatabases.Clear();
       _currentDatabase = null;
 
@@ -1572,7 +1888,22 @@ namespace keepass2android
       get => _activeContext ?? Application.Context;
       set
       {
+        if (Looper.MyLooper() != Looper.MainLooper)
+        {
+          UiThreadHandler.Post(() => ActiveContext = value);
+          return;
+        }
+        if (!ReferenceEquals(_activeContext, value))
+        {
+          // Host handoff only retires requests attached to the old Activity.
+          // Unbound checks remain valid for their exact still-open database.
+          foreach (var request in _reloadRequests.Values.Where(r => !r.Accepted && !ReferenceEquals(r.Activity, value)).ToList())
+            CompleteReloadRequest(request, false);
+          if (value == null)
+            ClearReloadRequests();
+        }
         _activeContext = value;
+        PostPendingChangedReloadDelivery();
         OperationRunner.Instance.SetNewActiveContext(App.Kp2a);
         _currentlyPendingYesNoCancelQuestion?.TryShow(this, OnUserInputDialogClose, OnUserInputDialogShow);
       }
@@ -1703,6 +2034,8 @@ namespace keepass2android
       CreateNotificationChannels();
 
       Kp2a.OnCreate(this);
+      KeeShare.KeeShareScheduler.DeviceId = KeeAutoExecExt.ThisDeviceId;
+      KeeShare.KeeShareScheduler.IsOffline = () => App.Kp2a.OfflineMode;
       AndroidEnvironment.UnhandledExceptionRaiser += MyApp_UnhandledExceptionHandler;
 
       IntentFilter intentFilter = new IntentFilter();

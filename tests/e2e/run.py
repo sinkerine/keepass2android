@@ -14,6 +14,8 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
+from adb_transfer import wait_until_idle
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -43,6 +45,16 @@ def emulator_ports():
                 yield port
                 return
     raise RuntimeError('No unused emulator port pair available')
+
+
+def settle(adb, env, record, label, limit):
+    # The emulator's ADB link can drop while the guest is saturated, as it is for
+    # about 20 s after boot; see adb_transfer.py.
+    settled, seconds, samples = wait_until_idle(adb, limit, env=env)
+    with open(record, 'a') as log:
+        log.write(f"{label}: {'settled' if settled else 'timed out'} after {seconds}s, idle samples {samples}\n")
+    if not settled:
+        raise RuntimeError(f'Guest stayed busy {limit}s after {label}; ADB transfers would be unreliable')
 
 
 def smoke(adb, package, artifacts):
@@ -93,6 +105,8 @@ def main():
     parser.add_argument('--apk', type=Path, help='Signed APK (defaults to the newest Debug APK)')
     parser.add_argument('--gui', action='store_true', help='Show the isolated emulator window')
     parser.add_argument('--boot-timeout', type=int, default=240)
+    parser.add_argument('--settle-timeout', type=int, default=180,
+                        help='Seconds to wait for an idle guest after boot and install (0 skips)')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='Optional command after --; receives ANDROID_SERIAL and private ADB server environment')
     args = parser.parse_args()
     # Convert normal termination into an exception so the finally block cleans up.
@@ -158,7 +172,11 @@ def main():
                 run(adb + ['shell', 'input', 'keyevent', '82'], env=env)
                 for name in ('window_animation_scale', 'transition_animation_scale', 'animator_duration_scale'):
                     run(adb + ['shell', 'settings', 'put', 'global', name, '0'], env=env)
+                if args.settle_timeout:
+                    settle(adb, env, artifacts / 'settle.txt', 'boot', args.settle_timeout)
                 run(adb + ['install', '--no-incremental', '-r', str(apk)], env=env, timeout=120)
+                if args.settle_timeout:
+                    settle(adb, env, artifacts / 'settle.txt', 'install', args.settle_timeout)
                 custom = args.command
                 if custom[:1] == ['--']:
                     custom = custom[1:]
@@ -168,6 +186,8 @@ def main():
                     # adb has explicit server/device arguments, including in the default smoke test.
                     smoke(adb, package, artifacts)
             finally:
+                # The emulator launcher execs qemu, so an exit here means it died during the run.
+                died = emulator.poll() if emulator is not None else None
                 if emulator is not None:
                     for name, command in [('logcat.txt', ['logcat', '-d']),
                                           ('screen.png', ['exec-out', 'screencap', '-p'])]:
@@ -184,6 +204,9 @@ def main():
                         emulator.kill()
                         emulator.wait(timeout=10)
                 subprocess.run(['adb', '-P', str(adb_port), 'kill-server'], env=env, timeout=15)
+                if died is not None:
+                    # Never report success for a run whose emulator crashed underneath it.
+                    raise RuntimeError(f'Emulator exited with status {died} before teardown; inspect emulator.log')
 
 
 if __name__ == '__main__':

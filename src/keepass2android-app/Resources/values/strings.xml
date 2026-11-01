@@ -750,8 +750,8 @@
   </string>
   <string name="open_other_db">Open another database…</string>
   <string name="select_database">Select database</string>
-  <string name="configure_child_dbs">Configure child databases…</string>
-  <string name="child_dbs_title">Child databases</string>
+  <string name="configure_child_dbs">Configure child databases (KeeAutoExec)…</string>
+  <string name="child_dbs_title">Child databases (KeeAutoExec)</string>
   <string name="unspecified">unspecified</string>
   <string name="child_db_explanation">Child databases are other databases which can be opened automatically when you open the parent database. Therefore, the child\'s master password and file location are stored in the parent. This feature allows to share some of your passwords with another person. The implementation is compatible with KeeAutoExec for PC.</string>
   <string name="child_db_enabled_on_this_device">Enabled on this device</string>
@@ -1376,4 +1376,47 @@
   <string name="pref_periodic_background_sync_interval_title">Periodic background synchronization time interval</string>
   <string name="pref_periodic_background_sync_interval_summary">Set the interval for background synchronization in minutes.</string>
     
+  <!-- KeeShare -->
+  <string name="KeeShareImportRequired">Enable KeeShare import before synchronizing this share.</string>
+  <string name="KeeShareImporting">Importing KeeShare…</string>
+  <string name="KeeShareExporting">Exporting KeeShare…</string>
+  <string name="KeeShareLocationNotSet">Location not set on this device</string>
+  <string name="KeeShareWrongPassword">Incorrect KeeShare password</string>
+  <string name="KeeShareFileNotFound">KeeShare file not found</string>
+  <string name="KeeShareImportedChanges">Imported changes from KeeShare</string>
+  <string name="KeeShareFailed">KeeShare failed</string>
+  <string name="KeeShareDatabaseReadOnly">The database is read only. KeeShare changes cannot be saved.</string>
+  <string name="KeeShareSmbCredentialsNeeded">Select the KeeShare file on this device to provide SMB credentials.</string>
+  <string name="KeeShareOffline">KeeShare is unavailable in offline mode</string>
+  <string name="KeeShareStorageUnavailable">KeeShare storage is unavailable</string>
+  <string name="KeeShareRememberMount">Also use %1$s for other shares under %2$s on this device</string>
+  <string name="keeshare_groups">KeeShare groups</string>
+  <string name="menu_keeshare">KeeShare…</string>
+  <string name="keeshare_type">Sharing type</string>
+  <string name="keeshare_type_inactive">Inactive</string>
+  <string name="keeshare_type_import">Import</string>
+  <string name="keeshare_type_export">Export</string>
+  <string name="keeshare_type_synchronize">Synchronize</string>
+  <string name="keeshare_imported_from">Imported from</string>
+  <string name="keeshare_exported_to">Exported to</string>
+  <string name="keeshare_synchronized_with">Synchronized with</string>
+  <string name="keeshare_next_to_database">Next to database: %1$s</string>
+  <string name="keeshare_sync_now">Sync now</string>
+  <string name="keeshare_path_label">KeePassXC / desktop path</string>
+  <string name="keeshare_password_label">Share password</string>
+  <string name="keeshare_password_reentry">Re-enter the share password after returning to this screen. Confirm an empty field only to use an empty password.</string>
+  <string name="keeshare_destination_unwritable">This location cannot be used for KeeShare export. Select a permanent writable destination.</string>
+  <string name="keeshare_destination_existing_file">Select an existing file for this provider. New files cannot be created here before saving the KeeShare settings.</string>
+  <string name="keeshare_keep_groups_label">Keep groups</string>
+  <string name="keeshare_pick_device_file_label">File on this device</string>
+  <string name="keeshare_clear_device_file_label">Clear device file</string>
+  <string name="keeshare_remove_label">Remove sharing</string>
+  <string name="keeshare_save_label">Save</string>
+  <string name="keeshare_readonly_info_label">Imported from KeeShare – read only</string>
+  <string name="keeshare_mounts_title">Mount mappings on this device</string>
+  <string name="keeshare_mount_remove_label">Remove mapping</string>
+  <string name="keeshare_import_title">KeeShare import</string>
+  <string name="keeshare_import_summary">Import KeeShare groups when opening or synchronizing a database.</string>
+  <string name="keeshare_export_title">KeeShare export</string>
+  <string name="keeshare_export_summary">Export KeeShare groups after saving or synchronizing a database.</string>
 </resources>

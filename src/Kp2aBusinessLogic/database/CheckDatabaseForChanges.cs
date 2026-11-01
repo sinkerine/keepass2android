@@ -31,19 +31,31 @@ namespace keepass2android
   public class CheckDatabaseForChanges : OperationWithFinishHandler
   {
     private readonly IKp2aApp _app;
+    private readonly Database _database;
+    private readonly Action<Database> _onReloadRequired;
 
+    // A successful check can still require a reload before the in-memory data is current.
+    public bool ReloadPending { get; private set; }
 
     public CheckDatabaseForChanges(IKp2aApp app, OnOperationFinishedHandler operationFinishedHandler)
+        : this(app, app.CurrentDb, operationFinishedHandler, database => app.TriggerReload(null, null))
+    {
+    }
+
+    public CheckDatabaseForChanges(IKp2aApp app, Database database,
+        OnOperationFinishedHandler operationFinishedHandler, Action<Database> onReloadRequired)
         : base(app, operationFinishedHandler)
     {
       _app = app;
+      _database = database;
+      _onReloadRequired = onReloadRequired;
     }
 
     public override void Run()
     {
       try
       {
-        IOConnectionInfo ioc = _app.CurrentDb.Ioc;
+        IOConnectionInfo ioc = _database.Ioc;
         IFileStorage fileStorage = _app.GetFileStorage(ioc);
         if (fileStorage is CachingFileStorage)
         {
@@ -63,9 +75,10 @@ namespace keepass2android
           hashingRemoteStream.CopyTo(remoteData);
           hashingRemoteStream.Close();
 
-          if (!MemUtil.ArraysEqual(_app.CurrentDb.KpDatabase.HashOfFileOnDisk, hashingRemoteStream.Hash))
+          if (!MemUtil.ArraysEqual(_database.KpDatabase.HashOfFileOnDisk, hashingRemoteStream.Hash))
           {
-            _app.TriggerReload(null, null);
+            ReloadPending = true;
+            _onReloadRequired?.Invoke(_database);
             Finish(true);
           }
           else

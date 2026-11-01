@@ -266,6 +266,12 @@ public class OperationRunner
 
   }
 
+  internal bool IsQueued(OperationWithFinishHandler operation)
+  {
+    lock (_taskQueueLock)
+      return _taskQueue.Any(task => ReferenceEquals(task.Operation, operation));
+  }
+
   public void CancelAll()
   {
     lock (_taskQueueLock)
