@@ -1,4 +1,6 @@
 """Synthetic inputs and persisted-output oracles for local acceptance gaps."""
+import base64
+from lxml import etree
 from pykeepass import PyKeePass, create_database
 from make_fixtures import make_fixtures, set_reference
 from journey_data import custom, put_custom, group_state
@@ -45,6 +47,14 @@ def prepare(outdir, canonical_files):
         target = missing.add_group(missing.root_group, name)
         set_reference(target, path)
         missing.add_entry(target, name + ' Preserved', 'synthetic', 'synthetic')
+    inactive = missing.add_group(missing.root_group, 'Inactive Control')
+    set_reference(inactive, 'team-import.kdbx')
+    encoded = inactive._element.find('CustomData/Item/Value')
+    reference = etree.fromstring(base64.b64decode(encoded.text))
+    for direction in list(reference.find('Type')):
+        reference.find('Type').remove(direction)
+    encoded.text = base64.b64encode(etree.tostring(reference)).decode('ascii')
+    missing.add_entry(inactive, 'Inactive Preserved', 'synthetic', 'synthetic')
     missing.add_group(missing.root_group, 'Team Sync')
     missing.add_group(missing.root_group, 'Personal')
     missing.save()

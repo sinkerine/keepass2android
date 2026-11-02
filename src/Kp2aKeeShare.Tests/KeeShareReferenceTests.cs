@@ -101,6 +101,21 @@ public class KeeShareReferenceTests
     Assert.Equal(expected, reference.KeepGroups);
   }
 
+  [Theory]
+  [InlineData(KeeShareType.Inactive, false, false)]
+  [InlineData(KeeShareType.Import, true, false)]
+  [InlineData(KeeShareType.Export, false, true)]
+  [InlineData(KeeShareType.Synchronize, true, true)]
+  public void EmptyPathPreservesDirectionWithoutChangingValidity(KeeShareType type, bool importing, bool exporting)
+  {
+    var reference = new KeeShareReference(type, new byte[16], "", "", false);
+    Assert.True(KeeShareReferenceCodec.TryDecode(KeeShareReferenceCodec.Encode(reference), out var decoded));
+    Assert.Equal("", decoded.Path);
+    Assert.False(decoded.IsValid);
+    Assert.Equal(importing, decoded.IsImporting);
+    Assert.Equal(exporting, decoded.IsExporting);
+  }
+
   [Fact]
   public void InactiveAndEmptyPathsAreNotValidAndUnknownElementsAreIgnored()
   {

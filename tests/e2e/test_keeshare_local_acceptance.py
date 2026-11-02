@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Host checks for the dedicated streamed installed-APK identity gate."""
+"""Host integration checks for the dedicated shared verified-pull identity gate."""
 import hashlib
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import tempfile
 import unittest
@@ -12,105 +11,109 @@ from unittest.mock import patch
 
 import keeshare_local_acceptance as scenario
 
-BASE = "/data/app/a'quote$(never-execute)/base.apk"
+BASE = '/data/app/test/base.apk'
 DATA = b'complete installed bytes'
 DIGEST = hashlib.sha256(DATA).hexdigest()
 
 
-class StreamedProvenanceTests(unittest.TestCase):
+class DedicatedInitializationTests(unittest.TestCase):
+    def test_new_pin_accepted_and_historical_or_wrong_pin_rejected(self):
+        def initialize(journey):
+            self.assertEqual(journey.commands, [])
+            self.assertFalse(journey.transport_failed)
+            self.assertFalse(journey.advanced_search)
+            self.assertEqual(journey.provenance['status'], 'collecting')
+            journey.package = 'test'
+            journey.apk = {'sha256': digest}
+        for digest in (scenario.APPROVED_APK,
+                       '98149d7c99a16222d02208a009e27ceaad9d1b2a851a2f609db7671577255216',
+                       '0' * 64):
+            with self.subTest(digest=digest), patch.object(scenario.Journey, '__init__', initialize):
+                if digest == scenario.APPROVED_APK:
+                    journey = scenario.LocalAcceptance()
+                    self.assertEqual(journey.observations, {})
+                    self.assertTrue(all(value['status'] == 'not-run' for value in journey.results.values()))
+                else:
+                    with self.assertRaisesRegex(AssertionError, 'dedicated approved build'):
+                        scenario.LocalAcceptance()
+
+
+class InstalledProvenanceTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.journey = scenario.LocalAcceptance.__new__(scenario.LocalAcceptance)
         self.journey.art = Path(temporary.name)
         self.journey.package = 'test'
-        self.journey.adb = ['adb', '-s', 'emulator-5554']
-        self.journey.provenance = {'status': 'collecting', 'transport_root_cause': 'unknown'}
+        self.journey.provenance = {'status': 'collecting'}
         self.journey.transport_failed = False
-        self.received, self.guest = DATA, DIGEST
-        self.returncode, self.timeout = 0, False
+        self.path_queries = 0
         self.changed_paths = False
-        self.calls = []
+        self.size = len(DATA)
+        self.digest = DIGEST
+        self.failure = False
         self.addCleanup(patch.stopall)
         patch.dict(os.environ, ANDROID_SERIAL='emulator-5554',
                    ADB_SERVER_SOCKET='tcp:127.0.0.1:43210').start()
         patch.object(scenario, 'EXPECTED_APK_BYTES', len(DATA)).start()
         patch.object(scenario, 'APPROVED_APK', DIGEST).start()
-        patch.object(scenario.subprocess, 'run', side_effect=self.command).start()
+        self.adb = patch.object(self.journey, 'adb_run', side_effect=self.paths).start()
+        self.transfer = patch.object(scenario, 'pull_verified', side_effect=self.pull).start()
 
-    def command(self, argv, **kwargs):
-        self.calls.append(argv)
-        self.assertEqual(argv[:3], ['adb', '-s', 'emulator-5554'])
-        self.assertNotIn('shell', kwargs)
-        args = argv[3:]
-        if args == ['shell', 'pm', 'path', 'test']:
-            path = '/data/app/changed/base.apk' if self.changed_paths and len(self.calls) > 1 else BASE
-            return subprocess.CompletedProcess(argv, 0, ('package:' + path + '\n').encode(), b'')
-        if args == ['exec-out', 'cat', BASE]:
-            self.assertEqual(kwargs['timeout'], 90)
-            kwargs['stdout'].write(self.received)
-            kwargs['stderr'].write(b'stream diagnostic')
-            if self.timeout:
-                raise subprocess.TimeoutExpired(argv, 90)
-            return subprocess.CompletedProcess(argv, self.returncode)
-        if args == ['shell', 'sha256sum', shlex.quote(BASE)]:
-            return subprocess.CompletedProcess(argv, 0, (self.guest + '  ' + BASE + '\n').encode(), b'')
-        self.fail('Unexpected command: ' + repr(argv))
+    def paths(self, *args):
+        self.assertEqual(args, ('shell', 'pm', 'path', 'test'))
+        self.path_queries += 1
+        path = '/data/app/changed/base.apk' if self.changed_paths and self.path_queries > 1 else BASE
+        return subprocess.CompletedProcess(args, 0, ('package:' + path + '\n').encode(), b'')
 
-    def test_complete_stream_requires_guest_hash_and_stable_paths(self):
-        result = self.journey.installed_apk()
-        self.assertEqual(result['sha256'], DIGEST)
-        self.assertEqual(result['guest_sha256'], DIGEST)
-        self.assertEqual(result['bytes'], len(DATA))
-        self.assertEqual(len(self.calls), 4)
-        proof = json.loads((self.journey.art / 'local-acceptance-streamed-provenance.json').read_text())
+    def pull(self, remote, local, **kwargs):
+        self.assertEqual(remote, BASE)
+        self.assertEqual(kwargs['expected_sha256'], DIGEST)
+        self.assertEqual(kwargs['attempts'], 3)
+        self.assertEqual(kwargs['timeout'], 90)
+        before = kwargs['check']()
+        if self.failure:
+            raise scenario.TransferError('bounded transport failure', {'status': 'failed', 'attempts': []})
+        after = kwargs['check']()
+        Path(local).write_bytes(DATA)
+        return {'status': 'verified', 'guest_size': self.size, 'received_bytes': self.size,
+                'guest_sha256': self.digest, 'received_sha256': self.digest,
+                'check_before': before, 'check_after': after, 'attempts': []}
+
+    def test_approved_identity_requires_shared_helper_and_stable_paths(self):
+        apk = self.journey.installed_apk()
+        self.assertEqual(apk['bytes'], len(DATA))
+        self.assertEqual(apk['sha256'], DIGEST)
+        self.assertEqual(apk['guest_sha256'], DIGEST)
+        self.assertEqual(self.path_queries, 3)
+        self.transfer.assert_called_once()
+        proof = json.loads((self.journey.art / 'local-acceptance-installed-provenance.json').read_text())
         self.assertEqual(proof['status'], 'verified')
-        stream = proof['commands'][1]
-        self.assertEqual(stream['stdout_bytes'], len(DATA))
-        self.assertEqual(stream['stderr'], 'stream diagnostic')
-        self.assertEqual(stream['returncode'], 0)
-        self.assertGreaterEqual(stream['duration_seconds'], 0)
-        self.assertFalse(self.journey.transport_failed)
+        self.assertEqual(proof['package_paths_before'], proof['package_paths_after'])
 
-    def test_short_stream_stops_without_retry_or_guest_acceptance(self):
-        self.received = DATA[:-1]
-        with self.assertRaisesRegex(RuntimeError, 'byte count mismatch'):
-            self.journey.installed_apk()
-        self.assertEqual(len(self.calls), 2)
-        self.assertTrue(self.journey.transport_failed)
-        self.assertEqual(self.journey.provenance['status'], 'failed')
-
-    def test_same_size_wrong_received_hash_is_refused(self):
-        self.received = b'x' * len(DATA)
-        with self.assertRaisesRegex(RuntimeError, 'identity mismatch'):
-            self.journey.installed_apk()
-        self.assertEqual(self.journey.provenance['received_sha256'], hashlib.sha256(self.received).hexdigest())
-
-    def test_guest_mismatch_is_refused(self):
-        self.guest = '0' * 64
-        with self.assertRaisesRegex(RuntimeError, 'identity mismatch'):
-            self.journey.installed_apk()
-
-    def test_changed_paths_are_refused(self):
+    def test_changed_path_is_refused_before_transfer(self):
         self.changed_paths = True
         with self.assertRaisesRegex(RuntimeError, 'paths changed'):
             self.journey.installed_apk()
+        self.assertTrue(self.journey.transport_failed)
 
-    def test_stream_nonzero_exit_stops_without_retry(self):
-        self.returncode = 1
-        with self.assertRaises(subprocess.CalledProcessError):
+    def test_approved_size_is_required_in_addition_to_hash(self):
+        self.size -= 1
+        with self.assertRaisesRegex(RuntimeError, 'approved size'):
             self.journey.installed_apk()
-        self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.journey.provenance['commands'][1]['returncode'], 1)
+        self.assertTrue(self.journey.transport_failed)
 
-    def test_timeout_preserves_partial_bytes_and_stops_without_retry(self):
-        self.received = DATA[:3]
-        self.timeout = True
-        with self.assertRaises(subprocess.TimeoutExpired):
+    def test_wrong_helper_identity_is_refused(self):
+        self.digest = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'approved hash'):
             self.journey.installed_apk()
-        self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.journey.provenance['received_bytes'], 3)
-        self.assertEqual(self.journey.provenance['commands'][1]['error'], 'timeout')
+
+    def test_transfer_failure_preserves_record_without_local_retry(self):
+        self.failure = True
+        with self.assertRaises(scenario.TransferError):
+            self.journey.installed_apk()
+        self.transfer.assert_called_once()
+        self.assertEqual(self.journey.provenance['transfer']['status'], 'failed')
         self.assertTrue(self.journey.transport_failed)
 
 

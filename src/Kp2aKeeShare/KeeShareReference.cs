@@ -25,8 +25,10 @@ public enum KeeShareType { Inactive = 0, Import = 1, Export = 2, Synchronize = I
 public sealed record KeeShareReference(
   KeeShareType Type, byte[] GroupUuid, string Path, string Password, bool KeepGroups)
 {
-  public bool IsImporting => (Type & KeeShareType.Import) != 0 && Path != "";
-  public bool IsExporting => (Type & KeeShareType.Export) != 0 && Path != "";
+  // Direction is independent of Path: a device IOC may supply the location,
+  // and active shares without one must reach location resolution to report Skipped.
+  public bool IsImporting => (Type & KeeShareType.Import) != 0;
+  public bool IsExporting => (Type & KeeShareType.Export) != 0;
   public bool IsValid => Type != KeeShareType.Inactive && Path != "";
 }
 

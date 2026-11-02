@@ -48,6 +48,7 @@ public class KeeSharePathTests
   [Theory]
   [InlineData("device", "/mnt/share/a.kdbx", "device")]
   [InlineData("device", "../invalid", "device")]
+  [InlineData("device", "", "device")]
   [InlineData(null, "/mnt/share/a.kdbx", "mapped")]
   [InlineData(null, "//host/share/a.kdbx", "mapped")]
   [InlineData(null, "smb://host/share/a.kdbx", "unc")]
@@ -58,6 +59,7 @@ public class KeeSharePathTests
   [InlineData(null, "content://provider/a", "notset")]
   [InlineData(null, "../a.kdbx", "notset")]
   [InlineData(null, "", "notset")]
+  [InlineData("", "", "notset")]
   [InlineData(null, ".", "notset")]
   public void ChooseHonorsPrecedence(string? device, string path, string expected)
   {

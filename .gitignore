@@ -4,6 +4,10 @@ PCtest
 /.dev/
 /result
 
+# Python test bytecode
+__pycache__/
+*.py[cod]
+
 *.suo
 *.userprefs
 *.user
