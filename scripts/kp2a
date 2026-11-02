@@ -35,11 +35,58 @@ case "${1:-help}" in
       -p:AndroidSdkDirectory="$ANDROID_HOME" -p:JavaSdkDirectory="$JAVA_HOME" \
       -p:AndroidPackageFormat=apk -p:EmbedAssembliesIntoApk=true "$@"
     ;;
+  release-key)
+    # Keep signing identity outside disposable .dev state and the Git checkout.
+    signing_dir="$HOME/.local/share/keepass2android/signing"
+    umask 077
+    mkdir -p "$signing_dir"
+    chmod 700 "$signing_dir"
+    exec 9>"$signing_dir/.lock"
+    flock 9
+    if [[ -e "$signing_dir/release.keystore" || -e "$signing_dir/release.password" ]]; then
+      echo "Signing files already exist in $signing_dir; refusing to overwrite them." >&2
+      exit 1
+    fi
+    openssl rand -hex 32 > "$signing_dir/release.password"
+    keytool -genkeypair -noprompt -storetype PKCS12 \
+      -keystore "$signing_dir/release.keystore" -alias kp2a \
+      -keyalg RSA -keysize 4096 -sigalg SHA256withRSA -validity 10000 \
+      -dname 'CN=Keepass2Android Local Release' \
+      -storepass:file "$signing_dir/release.password" \
+      -keypass:file "$signing_dir/release.password"
+    echo "Signing key: $signing_dir/release.keystore (alias kp2a)"
+    ;;
+  release)
+    shift
+    [[ -x "$DOTNET_ROOT/dotnet" ]] || { echo 'Run kp2a setup first.' >&2; exit 1; }
+    signing_dir="$HOME/.local/share/keepass2android/signing"
+    for signing_file in release.keystore release.password; do
+      [[ -s "$signing_dir/$signing_file" ]] || { echo "Missing $signing_dir/$signing_file; run kp2a release-key once." >&2; exit 1; }
+    done
+    (cd src/build-scripts && bash build-java.sh && bash build-native.sh)
+    ln -sfn Manifests/AndroidManifest_net.xml src/keepass2android-app/AndroidManifest.xml
+    # apksigner consumes separate lines when the same password file is used twice.
+    # Use an environment reference for the key password to keep one-line storage.
+    export KP2A_RELEASE_KEY_PASSWORD
+    KP2A_RELEASE_KEY_PASSWORD=$(< "$signing_dir/release.password")
+    dotnet publish src/keepass2android-app/keepass2android-app.csproj \
+      -c Release -p:Flavor=Net \
+      -p:AndroidSdkDirectory="$ANDROID_HOME" -p:JavaSdkDirectory="$JAVA_HOME" \
+      -p:AndroidPackageFormats=apk -p:EmbedAssembliesIntoApk=true \
+      -p:AndroidKeyStore=true -p:AndroidSigningKeyAlias=kp2a \
+      -p:AndroidSigningKeyStore="$signing_dir/release.keystore" \
+      -p:AndroidSigningStorePass="file:$signing_dir/release.password" \
+      -p:AndroidSigningKeyPass=env:KP2A_RELEASE_KEY_PASSWORD "$@"
+    apk="$root/src/keepass2android-app/bin/Release/net9.0-android/publish/keepass2android.keepass2android-Signed.apk"
+    apksigner verify --verbose --print-certs "$apk"
+    echo "Release APK: $apk"
+    sha256sum "$apk"
+    ;;
   e2e)
     shift
     exec python3 "$root/tests/e2e/run.py" "$@"
     ;;
   *)
-    echo 'Usage: kp2a {setup|test|build|e2e}'
+    echo 'Usage: kp2a {setup|test|build|release-key|release|e2e}'
     ;;
 esac

@@ -16,11 +16,29 @@ First setup needs network access for Nix packages, NuGet/Android workloads, the 
 
 `kp2a test` runs the existing net8.0 Autofill parser suite. Additional arguments pass through to `dotnet test`. `kp2a build` builds Java and native dependencies and signs a Debug APK using the debug manifest, without requiring release signing keys or cloud credentials. Additional arguments pass through to `dotnet build`. APKs are under `src/keepass2android-app/bin/Debug/net9.0-android/`. The build embeds managed assemblies so `adb install` works without IDE fast deployment. Existing Makefile workflows remain available.
 
+## Local signed release APK
+
+```sh
+# First time only; refuses to overwrite an existing key/password
+nix develop --command kp2a release-key
+nix develop --command kp2a release
+```
+
+The persistent local key lives at `$HOME/.local/share/keepass2android/signing/release.keystore` (alias `kp2a`), with a generated password in `release.password` alongside it. Keep both files backed up and private: losing the key prevents signing compatible updates. Signing material stays outside the checkout and disposable `.dev` directory. This certificate is different from the upstream release certificate.
+
+`kp2a release` builds Java/native dependencies, selects the online release manifest, and runs `dotnet publish` with `Release` configuration, `Net` flavor and APK packaging. The store password uses a file reference; the key password uses an environment reference loaded from the same local file (apksigner consumes separate lines when a file is referenced twice). The command verifies the signature with `apksigner` and prints the SHA-256 of `src/keepass2android-app/bin/Release/net9.0-android/publish/keepass2android.keepass2android-Signed.apk`. Extra arguments pass through to `dotnet publish`. Run Debug and Release builds sequentially because they share a manifest symlink and dependency outputs.
+
+The repository skill is [Android release APK](../.agents/skills/android-release/SKILL.md). To smoke-test this exact APK on a fresh isolated emulator, run:
+
+```sh
+nix develop --command kp2a e2e --apk "$PWD/src/keepass2android-app/bin/Release/net9.0-android/publish/keepass2android.keepass2android-Signed.apk"
+```
+
 ## Isolated emulator tests
 
 Enable KVM on the host and give your user read/write access to `/dev/kvm` (typically membership in the `kvm` group; log in again after changing groups). The runner fails with a clear error if KVM is unavailable. A display is needed only with `--gui`.
 
-`kp2a e2e` selects the newest signed Debug APK, starts a **fresh disposable Android 36 emulator**, waits for boot, installs the APK, and checks that the first-run Create database control opens a creation form. Each run has a temporary Android user directory, AVD directory, fresh writable disk, disabled snapshots, its own emulator port pair and its own ADB server. Existing devices and ADB servers are not used. The process and AVD data are removed on success or failure. Concurrent runs coordinate emulator ports using file locks.
+`kp2a e2e` selects the newest signed Debug APK, starts a **fresh disposable Android 36 emulator**, waits for boot, installs the APK, dismisses the first-launch changelog when present (as in Release builds), and checks that the first-run Create database control opens a creation form. Each run has a temporary Android user directory, AVD directory, fresh writable disk, disabled snapshots, its own emulator port pair and its own ADB server. Existing devices and ADB servers are not used. The process and AVD data are removed on success or failure. Concurrent runs coordinate emulator ports using file locks.
 
 ```sh
 # Test a specific APK

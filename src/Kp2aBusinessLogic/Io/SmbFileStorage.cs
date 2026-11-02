@@ -253,7 +253,8 @@ namespace Kp2aBusinessLogic.Io
 
 
 
-      public readonly SMB2Client Client = new SMB2Client();
+      // SMB 3.1.1 is opt-in in SMBLibrary; retain negotiation with older servers.
+      public readonly SMB2Client Client = new SMB2Client(enableSMB311Support: true);
 
 
       public readonly ISMBFileStore? FileStore;
@@ -598,6 +599,20 @@ namespace Kp2aBusinessLogic.Io
       ThrowIfFailed(status, "open directory for file details", info);
       try
       {
+        // A share root has no filename to search for. Opening its directory above
+        // validates access; an empty QueryDirectory pattern is invalid on Samba.
+        if (string.IsNullOrEmpty(info.LocalPath))
+        {
+          return new FileDescription
+          {
+            CanRead = true,
+            CanWrite = true,
+            DisplayName = info.Share,
+            IsDirectory = true,
+            Path = info.ToPath()
+          };
+        }
+
         status = conn.FileStore.QueryDirectory(out List<QueryDirectoryFileInformation> fileList, directoryHandle, info.Stem(), FileInformationClass.FileDirectoryInformation);
         if (status != NTStatus.STATUS_NO_SUCH_FILE)
         {

@@ -74,7 +74,17 @@ def smoke(adb, package, artifacts):
         except ET.ParseError:
             time.sleep(1)
             continue
-        create = next((n for n in tree.iter('node') if n.get('resource-id') == f'{package}:id/start_create'), None)
+        # Release builds show a changelog on first launch before the start screen.
+        nodes = list(tree.iter('node'))
+        if any(n.get('text') == 'Change log' and n.get('package') == package for n in nodes):
+            confirm = next((n for n in nodes if n.get('text') == 'OK'
+                            and n.get('package') == package and n.get('clickable') == 'true'), None)
+            if confirm is not None:
+                coords = list(map(int, re.findall(r'\d+', confirm.attrib['bounds'])))
+                run(adb + ['shell', 'input', 'tap', str((coords[0] + coords[2]) // 2),
+                           str((coords[1] + coords[3]) // 2)])
+                continue
+        create = next((n for n in nodes if n.get('resource-id') == f'{package}:id/start_create'), None)
         if create is not None:
             coords = list(map(int, re.findall(r'\d+', create.attrib['bounds'])))
             run(adb + ['shell', 'input', 'tap', str((coords[0] + coords[2]) // 2),
